@@ -32,7 +32,10 @@ class SoundPlayer(context: Context) {
     private var wakeLock: PowerManager.WakeLock? = null
     private var releaseRunnable: Runnable? = null
 
-    fun play(samples: ShortArray, volumePercent: Int) {
+    /**
+     * @param onDone viene chiamato quando il suono è finito (non se viene interrotto da stop()).
+     */
+    fun play(samples: ShortArray, volumePercent: Int, onDone: (() -> Unit)? = null) {
         stop()
         try {
             // Tiene sveglia la CPU per i pochi secondi in cui il suono è in riproduzione
@@ -66,11 +69,27 @@ class SoundPlayer(context: Context) {
             track = t
 
             val durationMs = samples.size * 1000L / SoundSynth.SAMPLE_RATE
-            val r = Runnable { stop() }
+            val r = Runnable {
+                releaseRunnable = null
+                // Prima avvio ciò che deve seguire (es. la voce), poi rilascio audio e CPU:
+                // così tra il suono e la voce la musica non "rimbalza" e la CPU non si addormenta.
+                try {
+                    onDone?.invoke()
+                } catch (e: Exception) {
+                    // il seguito è facoltativo
+                }
+                stop()
+            }
             releaseRunnable = r
             handler.postDelayed(r, durationMs + 400L)
         } catch (e: Exception) {
             stop()
+            // Anche se il suono non parte, la voce che doveva seguire deve comunque partire
+            try {
+                onDone?.invoke()
+            } catch (e2: Exception) {
+                // ignora
+            }
         }
     }
 

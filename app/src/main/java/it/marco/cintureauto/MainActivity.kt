@@ -45,6 +45,7 @@ class MainActivity : Activity() {
     companion object {
         private const val REQ_BASIC = 1
         private const val REQ_BG = 2
+        private const val REQ_EXPORT = 3
 
         private val COLOR_BG = Color.parseColor("#F2F4F8")
         private val COLOR_TEXT = Color.parseColor("#1B2430")
@@ -63,8 +64,21 @@ class MainActivity : Activity() {
     private lateinit var statusService: TextView
     private lateinit var statusCar: TextView
     private lateinit var statusSpeed: TextView
+    private lateinit var statusLimit: TextView
     private lateinit var statusPerms: TextView
+    private lateinit var statusTrip: TextView
     private lateinit var carNameInput: EditText
+
+    // parcheggio e registro viaggi
+    private lateinit var parkingInfo: TextView
+    private lateinit var tripsSummary: TextView
+    private lateinit var tripsRecent: TextView
+    private val tripStore by lazy { TripStore(this) }
+    private var tripsCache: List<Trip> = emptyList()
+    private var tripsCacheVersion = -1
+
+    /** Voce usata per le prove dalla schermata (il servizio ne ha una sua). */
+    private var announcerInstance: VoiceAnnouncer? = null
 
     private var askedBackground = false
     private var askedBattery = false
@@ -83,6 +97,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = Prefs(this)
+        announcerInstance = VoiceAnnouncer(this, prefs)
 
         val firstRun = !prefs.firstRunDone
         if (firstRun) {
@@ -102,6 +117,7 @@ class MainActivity : Activity() {
             // Riavvia il servizio se non c'è, oppure se era partito in modalità ridotta (senza GPS).
             if (svc == null || !svc.fgsHasLocation) CarAlertService.start(this)
         }
+        reloadTrips()
         handler.removeCallbacks(ticker)
         handler.post(ticker)
     }
@@ -113,6 +129,8 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         testPlayer.stop()
+        announcerInstance?.shutdown()
+        announcerInstance = null
         super.onDestroy()
     }
 
@@ -139,7 +157,7 @@ class MainActivity : Activity() {
         root.addView(label("Cinture Auto", 28f, Typeface.BOLD, COLOR_TEXT))
         root.addView(
             label(
-                "Il \"ding\" delle cinture appena ti colleghi all'auto, più un avviso quando superi la velocità impostata.",
+                "Il \"ding\" delle cinture appena ti colleghi all'auto, un avviso quando superi il limite, la posizione dell'auto parcheggiata e il registro dei tuoi viaggi.",
                 14f, Typeface.NORMAL, COLOR_MUTED
             )
         )
@@ -149,6 +167,8 @@ class MainActivity : Activity() {
         statusService = addLine(statusCard)
         statusCar = addLine(statusCard)
         statusSpeed = addLine(statusCard)
+        statusLimit = addLine(statusCard)
+        statusTrip = addLine(statusCard)
         statusPerms = addLine(statusCard)
         switchRow(statusCard, "Servizio sempre attivo", prefs.serviceEnabled) { checked ->
             onServiceSwitch(checked)
@@ -205,13 +225,64 @@ class MainActivity : Activity() {
             testPlayer.play(SoundSynth.chime(prefs.chimeStyle), prefs.volumePercent)
         }
 
+        // ---- Voce ----
+        val voiceCard = card("Voce")
+        switchRow(voiceCard, "Dì la frase dopo il suono", prefs.voiceEnabled) { checked ->
+            prefs.voiceEnabled = checked
+        }
+        note(voiceCard, "Frase da pronunciare:")
+        val phraseInput = EditText(this)
+        phraseInput.setText(prefs.voicePhrase)
+        phraseInput.setSingleLine(true)
+        phraseInput.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                prefs.voicePhrase = s?.toString() ?: ""
+            }
+        })
+        voiceCard.addView(phraseInput)
+        actionButton(voiceCard, "Scegli la voce") { pickVoice() }
+        seekRow(voiceCard, { "Velocità della voce: $it%" }, 50, 150, 5, prefs.voiceRatePercent) {
+            prefs.voiceRatePercent = it
+        }
+        seekRow(voiceCard, { "Tono della voce: $it%" }, 50, 150, 5, prefs.voicePitchPercent) {
+            prefs.voicePitchPercent = it
+        }
+        seekRow(voiceCard, { "Volume della voce: $it%" }, 20, 100, 5, prefs.voiceVolumePercent) {
+            prefs.voiceVolumePercent = it
+        }
+        note(
+            voiceCard,
+            "Le voci disponibili dipendono dal telefono (di solito quelle di Google): in «Scegli la voce» toccane una per ascoltarla. Per un tono più dolce prova una velocità tra 85% e 95%."
+        )
+        actionButton(voiceCard, "▶  Prova suono + voce") { testChimeAndVoice() }
+        actionButton(voiceCard, "Impostazioni di sintesi vocale del telefono") { openTtsSettings() }
+
         // ---- Avviso velocità ----
         val speedCard = card("Avviso di velocità")
         switchRow(speedCard, "Avvisami se supero il limite", prefs.speedEnabled) { checked ->
             prefs.speedEnabled = checked
             CarAlertService.instance?.refresh()
         }
-        seekRow(speedCard, { "Limite: $it km/h" }, 30, 250, 5, prefs.speedLimitKmh) {
+        switchRow(speedCard, "Limite automatico secondo la strada", prefs.autoLimit) { checked ->
+            prefs.autoLimit = checked
+            CarAlertService.instance?.refresh()
+        }
+        note(
+            speedCard,
+            "Il telefono riconosce la strada in cui ti trovi e ne usa il limite (dati OpenStreetMap). Serve la connessione dati e viene inviata solo la posizione approssimata (circa 100 m). Dove il limite non è noto usa quello manuale qui sotto."
+        )
+        seekRow(speedCard, { "Tolleranza: +$it km/h" }, 0, 20, 1, prefs.toleranceKmh) {
+            prefs.toleranceKmh = it
+            CarAlertService.instance?.refresh()
+        }
+        note(speedCard, "L'avviso suona quando superi il limite più la tolleranza: evita falsi allarmi per i piccoli scarti del GPS.")
+        seekRow(
+            speedCard,
+            { "Limite manuale (dove la strada non è nota): $it km/h" },
+            30, 250, 5, prefs.speedLimitKmh
+        ) {
             prefs.speedLimitKmh = it
             CarAlertService.instance?.refresh()
         }
@@ -237,6 +308,44 @@ class MainActivity : Activity() {
         actionButton(speedCard, "▶  Prova l'avviso di velocità") {
             testPlayer.play(SoundSynth.alarm(), prefs.volumePercent)
         }
+        note(speedCard, "Dati delle strade: © OpenStreetMap contributors.")
+
+        // ---- Parcheggio ----
+        val parkingCard = card("Dov'è parcheggiata l'auto")
+        switchRow(parkingCard, "Salva la posizione quando scendo dall'auto", prefs.parkingEnabled) { checked ->
+            prefs.parkingEnabled = checked
+            CarAlertService.instance?.refresh()
+        }
+        parkingInfo = addLine(parkingCard)
+        actionButton(parkingCard, "Mostra l'auto su mappa") { showParkingOnMap() }
+        actionButton(parkingCard, "Portami all'auto a piedi") { walkToParking() }
+        actionButton(parkingCard, "Condividi la posizione") { shareParking() }
+        actionButton(parkingCard, "Cancella la posizione salvata") { clearParking() }
+        note(
+            parkingCard,
+            "La posizione si salva da sola quando il Bluetooth dell'auto si disconnette (di solito quando spegni il motore). " +
+                "Se il GPS non vede il cielo (garage, galleria) viene salvato l'ultimo punto noto e te lo segnalo. " +
+                "I pulsanti aprono l'app di mappe del telefono (o Google Maps nel browser)."
+        )
+
+        // ---- Registro dei viaggi ----
+        val tripsCard = card("Registro dei viaggi")
+        switchRow(tripsCard, "Registra i miei viaggi", prefs.tripLogEnabled) { checked ->
+            prefs.tripLogEnabled = checked
+            CarAlertService.instance?.refresh()
+        }
+        tripsSummary = addLine(tripsCard)
+        tripsRecent = label("", 13f, Typeface.NORMAL, COLOR_TEXT)
+        tripsCard.addView(tripsRecent)
+        actionButton(tripsCard, "Esporta in Excel (.xlsx)") { exportTrips() }
+        actionButton(tripsCard, "Cancella tutti i viaggi") { confirmClearTrips() }
+        note(
+            tripsCard,
+            "Un viaggio inizia quando ti colleghi all'auto e finisce quando il Bluetooth si disconnette. " +
+                "Per ogni viaggio si salvano durata, chilometri, velocità massima e quante volte è suonato l'avviso di limite superato " +
+                "(serve l'avviso di velocità acceso). Si tengono solo i viaggi di almeno 300 m e 1 minuto. " +
+                "I dati restano sul telefono: il file Excel lo salvi tu, dove preferisci."
+        )
 
         // ---- Volume ----
         val volumeCard = card("Volume")
@@ -413,8 +522,30 @@ class MainActivity : Activity() {
                 if (prefs.gpsOnlyWithCar) "GPS: spento (parte quando l'auto si collega)"
                 else "GPS: non attivo (controlla i permessi)"
             CarAlertService.lastSpeedKmh < 0f -> "GPS acceso · in attesa del segnale…"
-            else -> "Velocità: ${CarAlertService.lastSpeedKmh.roundToInt()} km/h  (limite ${prefs.speedLimitKmh})"
+            else -> "Velocità: ${CarAlertService.lastSpeedKmh.roundToInt()} km/h"
         }
+
+        statusLimit.text = when {
+            !prefs.speedEnabled -> ""
+            svc != null && svc.gpsActive && CarAlertService.limitInfo.isNotEmpty() ->
+                CarAlertService.limitInfo
+            prefs.autoLimit ->
+                "Limite: automatico secondo la strada (manuale ${prefs.speedLimitKmh} km/h dove non è noto)"
+            else -> "Limite impostato: ${prefs.speedLimitKmh} km/h"
+        }
+        statusLimit.visibility = if (statusLimit.text.isEmpty()) View.GONE else View.VISIBLE
+
+        val trip = if (svc != null && svc.carConnected) svc.currentTrip() else null
+        if (trip != null) {
+            statusTrip.text = "Viaggio in corso: ${TextFormat.duration(trip.durationSec)} · " +
+                "${TextFormat.km(trip.distanceKm)} · max ${TextFormat.kmh(trip.maxSpeedKmh)}"
+            statusTrip.visibility = View.VISIBLE
+        } else {
+            statusTrip.visibility = View.GONE
+        }
+
+        if (tripsCacheVersion != CarAlertService.tripsVersion) reloadTrips()
+        renderParking(svc)
 
         val loc = hasFineLocation()
         val bg = hasBackgroundLocation()
@@ -572,6 +703,259 @@ class MainActivity : Activity() {
                     askBatteryExemption()
                 }
                 refreshStatus()
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // Dov'è parcheggiata l'auto
+    // -------------------------------------------------------------------------------------------
+
+    private fun renderParking(svc: CarAlertService?) {
+        val spot = prefs.parkingSpot
+        val sb = StringBuilder()
+        if (spot == null) {
+            sb.append("Nessuna posizione salvata: verrà salvata la prossima volta che il Bluetooth dell'auto si disconnette.")
+        } else {
+            val now = System.currentTimeMillis()
+            sb.append("Salvata: ${TextFormat.dateTime(spot.savedAtMs)} (${TextFormat.ago(now, spot.savedAtMs)})")
+            sb.append("\nCoordinate: ${TextFormat.coord(spot.lat, spot.lon)}")
+            if (spot.fixAgeAtSaveSec > ParkingSpot.APPROX_AGE_SEC) {
+                sb.append(
+                    "\n⚠ Il GPS non aveva segnale da ${TextFormat.duration(spot.fixAgeAtSaveSec)}: " +
+                        "è l'ultimo punto noto, l'auto potrebbe essere un po' più avanti (garage o galleria?)."
+                )
+            } else if (spot.accuracyM.isFinite() && spot.accuracyM > ParkingSpot.APPROX_ACCURACY_M) {
+                sb.append("\n⚠ Precisione scarsa (circa ${Math.round(spot.accuracyM)} m).")
+            }
+            if (svc != null && svc.carConnected) {
+                sb.append("\nL'auto è collegata ora: la nuova posizione verrà salvata quando si disconnette.")
+            }
+        }
+        if (!prefs.parkingEnabled) sb.append("\n(Salvataggio automatico disattivato)")
+
+        val text = sb.toString()
+        if (parkingInfo.text.toString() != text) parkingInfo.text = text
+    }
+
+    private fun requireSpot(): ParkingSpot? {
+        val spot = prefs.parkingSpot
+        if (spot == null) toast("Nessuna posizione salvata ancora.")
+        return spot
+    }
+
+    private fun showParkingOnMap() {
+        val spot = requireSpot() ?: return
+        try {
+            val uri = Uri.parse(MapLinks.geoUri(spot.lat, spot.lon, "Auto parcheggiata"))
+            startActivity(Intent(Intent.ACTION_VIEW, uri))
+        } catch (e: Exception) {
+            // nessuna app di mappe: si apre la pagina web
+            openWeb(MapLinks.webPoint(spot.lat, spot.lon))
+        }
+    }
+
+    private fun walkToParking() {
+        val spot = requireSpot() ?: return
+        openWeb(MapLinks.webWalkTo(spot.lat, spot.lon))
+    }
+
+    private fun openWeb(url: String) {
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        } catch (e: Exception) {
+            toast("Non trovo un'app per aprire la mappa.")
+        }
+    }
+
+    private fun shareParking() {
+        val spot = requireSpot() ?: return
+        val text = "La mia auto è parcheggiata qui: ${MapLinks.webPoint(spot.lat, spot.lon)}"
+        val send = Intent(Intent.ACTION_SEND)
+            .setType("text/plain")
+            .putExtra(Intent.EXTRA_TEXT, text)
+        try {
+            startActivity(Intent.createChooser(send, "Condividi la posizione dell'auto"))
+        } catch (e: Exception) {
+            toast("Non trovo un'app con cui condividere.")
+        }
+    }
+
+    private fun clearParking() {
+        prefs.parkingSpot = null
+        toast("Posizione cancellata.")
+        refreshStatus()
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // Registro dei viaggi
+    // -------------------------------------------------------------------------------------------
+
+    private fun reloadTrips() {
+        tripsCacheVersion = CarAlertService.tripsVersion
+        tripsCache = tripStore.loadAll()
+        renderTrips()
+    }
+
+    private fun renderTrips() {
+        val trips = tripsCache
+        if (trips.isEmpty()) {
+            tripsSummary.text = "Nessun viaggio registrato ancora."
+            tripsRecent.text = ""
+            tripsRecent.visibility = View.GONE
+            return
+        }
+
+        val totalKm = trips.sumOf { it.distanceKm }
+        val totalSec = trips.sumOf { it.durationSec }
+        val monitored = trips.filter { it.speedMonitored }
+        val summary = StringBuilder()
+        summary.append("Viaggi registrati: ${trips.size} · ${TextFormat.km(totalKm)} · ${TextFormat.duration(totalSec)} alla guida")
+        if (monitored.isNotEmpty()) {
+            summary.append("\nSuperamenti del limite in totale: ${monitored.sumOf { it.overspeedCount }}")
+        }
+        tripsSummary.text = summary.toString()
+
+        val recent = trips.sortedByDescending { it.startMs }.take(5)
+        tripsRecent.text = "Ultimi viaggi:\n\n" + recent.joinToString("\n\n") { t ->
+            val over = if (t.speedMonitored) {
+                val n = t.overspeedCount
+                "$n ${if (n == 1) "superamento" else "superamenti"} del limite"
+            } else {
+                "velocità non controllata"
+            }
+            "${TextFormat.shortDateTime(t.startMs)} · ${TextFormat.km(t.distanceKm)} · ${TextFormat.duration(t.durationSec)}" +
+                "\n    max ${TextFormat.kmh(t.maxSpeedKmh)} · $over"
+        }
+        tripsRecent.visibility = View.VISIBLE
+    }
+
+    private fun exportTrips() {
+        reloadTrips()
+        if (tripsCache.isEmpty()) {
+            toast("Non ci sono ancora viaggi da esportare.")
+            return
+        }
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT)
+            .addCategory(Intent.CATEGORY_OPENABLE)
+            .setType(TripExport.MIME_TYPE)
+            .putExtra(Intent.EXTRA_TITLE, TripExport.suggestedFileName(System.currentTimeMillis()))
+        try {
+            startActivityForResult(intent, REQ_EXPORT)
+        } catch (e: Exception) {
+            toast("Questo telefono non permette di salvare file da qui.")
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQ_EXPORT || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        writeExport(uri)
+    }
+
+    private fun writeExport(uri: Uri) {
+        val count = tripsCache.size
+        try {
+            val bytes = TripExport.toXlsx(tripsCache)
+            val out = contentResolver.openOutputStream(uri, "wt")
+            if (out == null) {
+                toast("Non sono riuscito a salvare il file.")
+                return
+            }
+            out.use { it.write(bytes) }
+        } catch (e: Exception) {
+            toast("Non sono riuscito a salvare il file.")
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("File salvato")
+            .setMessage("Il file Excel con $count viaggi è stato salvato dove hai scelto.")
+            .setPositiveButton("Apri") { _, _ -> openExported(uri) }
+            .setNegativeButton("Chiudi", null)
+            .show()
+    }
+
+    private fun openExported(uri: Uri) {
+        val view = Intent(Intent.ACTION_VIEW)
+            .setDataAndType(uri, TripExport.MIME_TYPE)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        try {
+            startActivity(view)
+        } catch (e: Exception) {
+            toast("Il file è salvato, ma sul telefono non c'è un'app per aprire i file Excel (prova Fogli Google o Microsoft Excel).")
+        }
+    }
+
+    private fun confirmClearTrips() {
+        if (tripsCache.isEmpty()) {
+            toast("Non c'è niente da cancellare.")
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Cancellare tutti i viaggi?")
+            .setMessage("Verranno eliminati ${tripsCache.size} viaggi dal telefono. Se ti servono, esportali prima in Excel.")
+            .setPositiveButton("Cancella") { _, _ ->
+                tripStore.clearAll()
+                reloadTrips()
+            }
+            .setNegativeButton("Annulla", null)
+            .show()
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // Voce: scelta e prove
+    // -------------------------------------------------------------------------------------------
+
+    private fun currentPhrase(): String {
+        return prefs.voicePhrase.trim().ifEmpty { Prefs.DEFAULT_PHRASE }
+    }
+
+    private fun pickVoice() {
+        val a = announcerInstance
+        if (a == null || !a.isReady()) {
+            toast(a?.problemText() ?: "Voce non disponibile.")
+            return
+        }
+        val voices = a.italianVoices()
+        if (voices.isEmpty()) {
+            toast("Nessuna voce italiana trovata. Aprila da «Impostazioni di sintesi vocale» e scarica l'italiano.")
+            return
+        }
+        val labels = voices.mapIndexed { index, v ->
+            val online = if (v.isNetworkConnectionRequired) " · online" else ""
+            "Voce ${index + 1}  (${v.name})$online"
+        }.toTypedArray()
+        val selected = voices.indexOfFirst { it.name == prefs.voiceName }
+
+        AlertDialog.Builder(this)
+            .setTitle("Scegli la voce")
+            .setSingleChoiceItems(labels, selected) { _, which ->
+                prefs.voiceName = voices[which].name
+                a.announce(currentPhrase(), 0L)
+            }
+            .setPositiveButton("Fatto", null)
+            .setNeutralButton("Voce predefinita") { _, _ -> prefs.voiceName = "" }
+            .show()
+    }
+
+    private fun testChimeAndVoice() {
+        val a = announcerInstance
+        if (a != null && !a.isReady()) toast(a.problemText())
+        val phrase = currentPhrase()
+        testPlayer.play(SoundSynth.chime(prefs.chimeStyle), prefs.volumePercent) {
+            announcerInstance?.announce(phrase, 250L)
+        }
+    }
+
+    private fun openTtsSettings() {
+        try {
+            startActivity(Intent("com.android.settings.TTS_SETTINGS"))
+        } catch (e: Exception) {
+            try {
+                startActivity(Intent(Settings.ACTION_SETTINGS))
+            } catch (e2: Exception) {
+                toast("Apri Impostazioni → Sistema → Lingua → Sintesi vocale.")
             }
         }
     }

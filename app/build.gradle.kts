@@ -11,8 +11,19 @@ android {
         applicationId = "it.marco.cintureauto"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 3
+        versionName = "1.2"
+    }
+
+    // Chiave di firma fissa (inclusa nel progetto): così ogni nuova versione compilata si installa
+    // sopra la precedente senza disinstallare. È una chiave "di debug": va bene per un'app personale.
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
     }
 
     buildTypes {

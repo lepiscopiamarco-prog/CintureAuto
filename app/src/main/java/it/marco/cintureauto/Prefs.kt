@@ -67,7 +67,70 @@ class Prefs(context: Context) {
         get() = sp.getInt("volumePercent", 100)
         set(v) { sp.edit().putInt("volumePercent", v).apply() }
 
+    // ---- Voce ----
+
+    /** Dice la frase a voce dopo il suono. */
+    var voiceEnabled: Boolean
+        get() = sp.getBoolean("voiceEnabled", true)
+        set(v) { sp.edit().putBoolean("voiceEnabled", v).apply() }
+
+    var voicePhrase: String
+        get() = sp.getString("voicePhrase", DEFAULT_PHRASE) ?: DEFAULT_PHRASE
+        set(v) { sp.edit().putString("voicePhrase", v).apply() }
+
+    /** Nome tecnico della voce scelta (vuoto = voce italiana predefinita del telefono). */
+    var voiceName: String
+        get() = sp.getString("voiceName", "") ?: ""
+        set(v) { sp.edit().putString("voiceName", v).apply() }
+
+    /** Velocità di lettura in percentuale (100 = normale). Un po' più lenta = più elegante. */
+    var voiceRatePercent: Int
+        get() = sp.getInt("voiceRatePercent", 90)
+        set(v) { sp.edit().putInt("voiceRatePercent", v).apply() }
+
+    var voicePitchPercent: Int
+        get() = sp.getInt("voicePitchPercent", 100)
+        set(v) { sp.edit().putInt("voicePitchPercent", v).apply() }
+
+    /** Volume della voce: più basso del suono, per un tono "tenue". */
+    var voiceVolumePercent: Int
+        get() = sp.getInt("voiceVolumePercent", 80)
+        set(v) { sp.edit().putInt("voiceVolumePercent", v).apply() }
+
+    // ---- Limite automatico ----
+
+    /** Ricava il limite dalla strada in cui ci si trova (dati OpenStreetMap). */
+    var autoLimit: Boolean
+        get() = sp.getBoolean("autoLimit", true)
+        set(v) { sp.edit().putBoolean("autoLimit", v).apply() }
+
+    /** Margine in km/h oltre il limite prima che suoni l'avviso. */
+    var toleranceKmh: Int
+        get() = sp.getInt("toleranceKmh", 5)
+        set(v) { sp.edit().putInt("toleranceKmh", v).apply() }
+
+    // ---- Parcheggio e registro dei viaggi ----
+
+    /** Salva la posizione dell'auto quando il Bluetooth si disconnette. */
+    var parkingEnabled: Boolean
+        get() = sp.getBoolean("parkingEnabled", true)
+        set(v) { sp.edit().putBoolean("parkingEnabled", v).apply() }
+
+    /** Ultima posizione salvata (null = nessuna). */
+    var parkingSpot: ParkingSpot?
+        get() = ParkingCodec.decode(sp.getString("parkingSpot", null))
+        set(v) {
+            if (v == null) sp.edit().remove("parkingSpot").apply()
+            else sp.edit().putString("parkingSpot", ParkingCodec.encode(v)).apply()
+        }
+
+    /** Registra durata, chilometri, velocità massima e superamenti di ogni viaggio. */
+    var tripLogEnabled: Boolean
+        get() = sp.getBoolean("tripLogEnabled", true)
+        set(v) { sp.edit().putBoolean("tripLogEnabled", v).apply() }
+
     companion object {
         const val DEFAULT_CAR_NAME = "MB Bluetooth"
+        const val DEFAULT_PHRASE = "Allacciare le cinture di sicurezza"
     }
 }
