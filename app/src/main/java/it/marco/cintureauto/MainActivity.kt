@@ -46,6 +46,7 @@ class MainActivity : Activity() {
         private const val REQ_BASIC = 1
         private const val REQ_BG = 2
         private const val REQ_EXPORT = 3
+        private const val REQ_MIC = 4
 
         private val COLOR_BG = Color.parseColor("#F2F4F8")
         private val COLOR_TEXT = Color.parseColor("#1B2430")
@@ -73,6 +74,8 @@ class MainActivity : Activity() {
     private lateinit var parkingInfo: TextView
     private lateinit var tripsSummary: TextView
     private lateinit var tripsRecent: TextView
+    private lateinit var weatherInfo: TextView
+    private lateinit var assistantInfo: TextView
     private val tripStore by lazy { TripStore(this) }
     private var tripsCache: List<Trip> = emptyList()
     private var tripsCacheVersion = -1
@@ -115,7 +118,9 @@ class MainActivity : Activity() {
         if (prefs.serviceEnabled && hasBasicPermissions()) {
             val svc = CarAlertService.instance
             // Riavvia il servizio se non c'è, oppure se era partito in modalità ridotta (senza GPS).
-            if (svc == null || !svc.fgsHasLocation) CarAlertService.start(this)
+            // (o senza microfono, se l'assistente vocale è acceso: Android lo concede solo ad app aperta).
+            val needsMic = prefs.assistantEnabled && hasRecordAudio() && svc != null && !svc.fgsHasMic
+            if (svc == null || !svc.fgsHasLocation || needsMic) CarAlertService.start(this)
         }
         reloadTrips()
         handler.removeCallbacks(ticker)
@@ -154,7 +159,7 @@ class MainActivity : Activity() {
         )
         setContentView(scroll)
 
-        root.addView(label("Cinture Auto", 28f, Typeface.BOLD, COLOR_TEXT))
+        root.addView(label("My Mercedes", 28f, Typeface.BOLD, COLOR_TEXT))
         root.addView(
             label(
                 "Il \"ding\" delle cinture appena ti colleghi all'auto, un avviso quando superi il limite, la posizione dell'auto parcheggiata e il registro dei tuoi viaggi.",
@@ -326,6 +331,39 @@ class MainActivity : Activity() {
             "La posizione si salva da sola quando il Bluetooth dell'auto si disconnette (di solito quando spegni il motore). " +
                 "Se il GPS non vede il cielo (garage, galleria) viene salvato l'ultimo punto noto e te lo segnalo. " +
                 "I pulsanti aprono l'app di mappe del telefono (o Google Maps nel browser)."
+        )
+
+        // ---- Meteo ----
+        val weatherCard = card("Allerta meteo per l'auto parcheggiata")
+        switchRow(weatherCard, "Avvisami di grandine o gelata dove ho parcheggiato", prefs.weatherAlertEnabled) { checked ->
+            prefs.weatherAlertEnabled = checked
+            if (checked && prefs.carParked) WeatherScheduler.schedule(this, 5_000L) else WeatherScheduler.cancel(this)
+            refreshStatus()
+        }
+        weatherInfo = addLine(weatherCard)
+        actionButton(weatherCard, "Controlla adesso") { checkWeatherNow() }
+        note(
+            weatherCard,
+            "Mentre l'auto è parcheggiata, ogni 2 ore il telefono chiede la previsione per quel punto. " +
+                "Se nelle prossime 18 ore sono previsti grandine o temperature sotto zero di notte, ricevi una notifica urgente " +
+                "con suono. Viene inviata solo la posizione approssimata (circa 1 km). Previsioni: Open-Meteo.com (CC BY 4.0). " +
+                "La previsione della grandine è indicativa: non intercetta tutti i temporali."
+        )
+
+        // ---- Assistente vocale ----
+        val assistantCard = card("Assistente vocale «Ehi Mercedes» (sperimentale)")
+        switchRow(assistantCard, "Ascolta «Ehi Mercedes» quando sono in auto", prefs.assistantEnabled) { checked ->
+            onAssistantSwitch(checked)
+        }
+        assistantInfo = addLine(assistantCard)
+        actionButton(assistantCard, "Scarica il modello vocale italiano (circa 50 MB)") { downloadVoiceModel() }
+        actionButton(assistantCard, "▶  Prova la risposta sul limite") { testLimitAnswer() }
+        note(
+            assistantCard,
+            "Con l'auto collegata di' «Ehi Mercedes, qual è il limite di velocità?» (oppure «Ehi Mercedes», aspetta «Dimmi» e poi chiedi). " +
+                "Il riconoscimento avviene solo sul telefono: l'audio non viene inviato a nessuno. " +
+                "Il modello vocale si scarica una volta (meglio con il Wi-Fi). Il microfono resta acceso finché l'auto è collegata: " +
+                "consuma un po' di batteria. Dopo un riavvio del telefono apri l'app una volta per riattivare l'ascolto."
         )
 
         // ---- Registro dei viaggi ----
@@ -546,6 +584,8 @@ class MainActivity : Activity() {
 
         if (tripsCacheVersion != CarAlertService.tripsVersion) reloadTrips()
         renderParking(svc)
+        renderWeather()
+        renderAssistant(svc)
 
         val loc = hasFineLocation()
         val bg = hasBackgroundLocation()
@@ -681,7 +721,7 @@ class MainActivity : Activity() {
                 .setData(Uri.parse("package:$packageName"))
             startActivity(intent)
         } catch (e: Exception) {
-            toast("Apri le impostazioni del telefono → App → Cinture Auto.")
+            toast("Apri le impostazioni del telefono → App → My Mercedes.")
         }
     }
 
@@ -696,6 +736,15 @@ class MainActivity : Activity() {
                 if (prefs.serviceEnabled) afterBasicPermissions()
                 refreshStatus()
             }
+            REQ_MIC -> {
+                if (hasRecordAudio()) {
+                    if (prefs.serviceEnabled) CarAlertService.start(this)
+                    if (!VoiceModel.isReady(this)) downloadVoiceModel()
+                } else {
+                    toast("Senza il permesso del microfono l'assistente vocale non può ascoltare.")
+                }
+                refreshStatus()
+            }
             REQ_BG -> {
                 if (prefs.serviceEnabled) {
                     // riavvia il servizio: ora può ottenere la posizione anche in background
@@ -705,6 +754,102 @@ class MainActivity : Activity() {
                 refreshStatus()
             }
         }
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // Meteo
+    // -------------------------------------------------------------------------------------------
+
+    private fun renderWeather() {
+        val text = when {
+            !prefs.weatherAlertEnabled -> "Disattivata."
+            !prefs.carParked -> "Si attiva quando parcheggi (alla disconnessione del Bluetooth)."
+            prefs.weatherStatus.isNotEmpty() -> prefs.weatherStatus
+            else -> "Auto parcheggiata: primo controllo entro pochi minuti."
+        }
+        if (weatherInfo.text.toString() != text) weatherInfo.text = text
+    }
+
+    private fun checkWeatherNow() {
+        if (prefs.parkingSpot == null) {
+            toast("Nessuna posizione di parcheggio salvata.")
+            return
+        }
+        toast("Controllo la previsione…")
+        val app = applicationContext
+        Thread {
+            // il controllo manuale vale anche con l'auto collegata, senza cambiare la pianificazione
+            val wasParked = prefs.carParked
+            if (!wasParked) prefs.carParked = true
+            val result = WeatherCheck.run(app, reschedule = wasParked)
+            if (!wasParked) prefs.carParked = false
+            handler.post {
+                toast(result)
+                refreshStatus()
+            }
+        }.start()
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // Assistente vocale
+    // -------------------------------------------------------------------------------------------
+
+    private fun hasRecordAudio(): Boolean = granted(Manifest.permission.RECORD_AUDIO)
+
+    private fun onAssistantSwitch(checked: Boolean) {
+        prefs.assistantEnabled = checked
+        if (checked) {
+            if (!hasRecordAudio()) {
+                requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQ_MIC)
+                return
+            }
+            if (!VoiceModel.isReady(this)) downloadVoiceModel()
+        }
+        // il servizio riparte con (o senza) il microfono
+        if (prefs.serviceEnabled) CarAlertService.start(this)
+        CarAlertService.instance?.refresh()
+        refreshStatus()
+    }
+
+    private fun renderAssistant(svc: CarAlertService?) {
+        val text = when {
+            VoiceModel.downloading -> VoiceModel.progressText
+            !prefs.assistantEnabled -> "Spento."
+            !hasRecordAudio() -> "Manca il permesso del microfono: spegni e riaccendi l'interruttore."
+            !VoiceModel.isReady(this) ->
+                VoiceModel.progressText.ifEmpty { "Manca il modello vocale: tocca «Scarica il modello vocale»." }
+            svc == null -> "Il servizio non è attivo."
+            else -> CarAlertService.assistantInfo.ifEmpty { "In preparazione…" }
+        }
+        if (assistantInfo.text.toString() != text) assistantInfo.text = text
+    }
+
+    private fun downloadVoiceModel() {
+        if (VoiceModel.downloading) {
+            toast("Download già in corso.")
+            return
+        }
+        if (VoiceModel.isReady(this)) {
+            toast("Il modello vocale è già sul telefono.")
+            return
+        }
+        val app = applicationContext
+        Thread {
+            val ok = VoiceModel.download(app)
+            handler.post {
+                toast(if (ok) "Modello vocale pronto." else VoiceModel.progressText)
+                if (ok) CarAlertService.instance?.refresh()
+                refreshStatus()
+            }
+        }.start()
+        refreshStatus()
+    }
+
+    private fun testLimitAnswer() {
+        val answer = CarAlertService.instance?.spokenLimitAnswer()
+            ?: "Il servizio non è attivo, quindi non conosco la strada."
+        toast(answer)
+        announcerInstance?.announce(answer, 0L)
     }
 
     // -------------------------------------------------------------------------------------------
@@ -783,6 +928,8 @@ class MainActivity : Activity() {
 
     private fun clearParking() {
         prefs.parkingSpot = null
+        prefs.carParked = false
+        WeatherScheduler.cancel(this)
         toast("Posizione cancellata.")
         refreshStatus()
     }

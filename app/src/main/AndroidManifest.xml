@@ -14,12 +14,16 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
+    <!-- Microfono: assistente vocale «Ehi Mercedes» (riconoscimento solo sul telefono) -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
-    <!-- Internet: solo per scaricare i limiti di velocità delle strade (OpenStreetMap) -->
+    <!-- Internet: limiti delle strade (OpenStreetMap), previsioni meteo (Open-Meteo), modello vocale (una volta) -->
     <uses-permission android:name="android.permission.INTERNET" />
 
     <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
@@ -51,7 +55,11 @@
         <service
             android:name=".CarAlertService"
             android:exported="false"
-            android:foregroundServiceType="location|connectedDevice" />
+            android:foregroundServiceType="location|connectedDevice|microphone" />
+
+        <receiver
+            android:name=".WeatherReceiver"
+            android:exported="false" />
 
         <receiver
             android:name=".SystemEventsReceiver"

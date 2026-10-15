@@ -129,6 +129,38 @@ class Prefs(context: Context) {
         get() = sp.getBoolean("tripLogEnabled", true)
         set(v) { sp.edit().putBoolean("tripLogEnabled", v).apply() }
 
+    // ---- Notifica meteo preventiva ----
+
+    /** Avvisa se dove è parcheggiata l'auto sono previste grandine o gelata notturna. */
+    var weatherAlertEnabled: Boolean
+        get() = sp.getBoolean("weatherAlertEnabled", true)
+        set(v) { sp.edit().putBoolean("weatherAlertEnabled", v).apply() }
+
+    /** Vero dal momento in cui l'auto viene parcheggiata fino al successivo collegamento. */
+    var carParked: Boolean
+        get() = sp.getBoolean("carParked", false)
+        set(v) { sp.edit().putBoolean("carParked", v).apply() }
+
+    var weatherLastKey: String
+        get() = sp.getString("weatherLastKey", "") ?: ""
+        set(v) { sp.edit().putString("weatherLastKey", v).apply() }
+
+    var weatherLastAt: Long
+        get() = sp.getLong("weatherLastAt", 0L)
+        set(v) { sp.edit().putLong("weatherLastAt", v).apply() }
+
+    /** Esito dell'ultimo controllo, mostrato nella schermata. */
+    var weatherStatus: String
+        get() = sp.getString("weatherStatus", "") ?: ""
+        set(v) { sp.edit().putString("weatherStatus", v).apply() }
+
+    // ---- Assistente vocale ----
+
+    /** Ascolta «Ehi Mercedes» mentre l'auto è collegata (sperimentale, spento di default). */
+    var assistantEnabled: Boolean
+        get() = sp.getBoolean("assistantEnabled", false)
+        set(v) { sp.edit().putBoolean("assistantEnabled", v).apply() }
+
     companion object {
         const val DEFAULT_CAR_NAME = "MB Bluetooth"
         const val DEFAULT_PHRASE = "Allacciare le cinture di sicurezza"

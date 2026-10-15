@@ -34,6 +34,11 @@ object BtUtils {
             PackageManager.PERMISSION_GRANTED
     }
 
+    fun hasRecordAudio(context: Context): Boolean {
+        return context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+    }
+
     fun hasFineLocation(context: Context): Boolean {
         return context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) ==
             PackageManager.PERMISSION_GRANTED

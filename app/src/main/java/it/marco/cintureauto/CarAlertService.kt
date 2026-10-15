@@ -96,6 +96,14 @@ class CarAlertService : Service() {
         /** Il Bluetooth può mandare due volte lo stesso evento: si salva una sola volta. */
         private const val PARKING_DEDUPE_MS = 15_000L
 
+        // ---- assistente vocale ----
+        private const val ASSISTANT_PAUSE_FOR_CHIME_MS = 9_000L
+        private const val ASSISTANT_PAUSE_FOR_ALARM_MS = 2_500L
+        private const val ASSISTANT_REPLY_FAILSAFE_MS = 15_000L
+
+        // ---- meteo ----
+        private const val WEATHER_FIRST_CHECK_MS = 60_000L
+
         private const val DATA_NONE = 0
         private const val DATA_OK = 1
         private const val DATA_ERROR = 2
@@ -109,6 +117,10 @@ class CarAlertService : Service() {
         /** Descrizione del limite in uso, mostrata nella schermata principale. */
         @Volatile
         var limitInfo: String = ""
+
+        /** Stato dell'assistente vocale, mostrato nella schermata principale. */
+        @Volatile
+        var assistantInfo: String = ""
 
         /** Aumenta ogni volta che l'elenco dei viaggi cambia: la schermata lo usa per aggiornarsi. */
         @Volatile
@@ -160,6 +172,13 @@ class CarAlertService : Service() {
     @Volatile
     var fgsHasLocation: Boolean = true
         private set
+
+    /** Vero se il servizio può usare il microfono anche a schermo spento (assistente vocale). */
+    @Volatile
+    var fgsHasMic: Boolean = false
+        private set
+
+    private var assistant: VoiceAssistant? = null
 
     private var pendingChime: Runnable? = null
     private var lastChimeAt: Long = -1L
@@ -232,6 +251,9 @@ class CarAlertService : Service() {
 
     override fun onDestroy() {
         destroyed = true
+        assistant?.stop()
+        assistant = null
+        assistantInfo = ""
         finishTrip()
         stopGps()
         cancelPendingChime()
@@ -259,7 +281,7 @@ class CarAlertService : Service() {
     private fun createChannel() {
         val channel = NotificationChannel(
             CHANNEL_ID,
-            "Servizio Cinture Auto",
+            "Servizio My Mercedes",
             NotificationManager.IMPORTANCE_LOW
         )
         channel.description = "Notifica fissa che tiene attiva l'app in background"
@@ -279,6 +301,24 @@ class CarAlertService : Service() {
                 false
             }
         }
+
+        // 0) Con l'assistente vocale: posizione + microfono. Android lo permette solo se il servizio
+        //    parte mentre l'app è aperta sullo schermo; altrimenti si ripiega sui casi sotto.
+        if (prefs.assistantEnabled && BtUtils.hasRecordAudio(this)) {
+            try {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                )
+                fgsHasLocation = true
+                fgsHasMic = true
+                return true
+            } catch (e: Exception) {
+                // non consentito adesso: si continua senza microfono
+            }
+        }
+        fgsHasMic = false
 
         // 1) Modalità completa: "posizione" (GPS a schermo spento) + Bluetooth.
         try {
@@ -316,7 +356,7 @@ class CarAlertService : Service() {
         )
         return Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_belt)
-            .setContentTitle("Cinture Auto attiva")
+            .setContentTitle("My Mercedes attiva")
             .setContentText(statusText())
             .setContentIntent(openIntent)
             .setOngoing(true)
@@ -429,6 +469,10 @@ class CarAlertService : Service() {
 
     private fun onCarConnected() {
         carConnected = true
+        // l'auto non è più parcheggiata: niente più controlli meteo
+        prefs.carParked = false
+        WeatherScheduler.cancel(this)
+        WeatherNotifier.dismiss(this)
         resetSpeedState()
         updateGpsState()
 
@@ -502,6 +546,7 @@ class CarAlertService : Service() {
         val phrase = prefs.voicePhrase.trim().ifEmpty { Prefs.DEFAULT_PHRASE }
         val speak: () -> Unit = { announcer.announce(phrase, VOICE_GAP_MS) }
 
+        assistant?.pauseFor(ASSISTANT_PAUSE_FOR_CHIME_MS)
         if (prefs.chimeEnabled) {
             player.play(
                 SoundSynth.chime(prefs.chimeStyle),
@@ -545,6 +590,7 @@ class CarAlertService : Service() {
             stopGps()
         }
         syncTrip()
+        syncAssistant()
         updateNotification()
     }
 
@@ -673,6 +719,75 @@ class CarAlertService : Service() {
     }
 
     // -------------------------------------------------------------------------------------------
+    // Assistente vocale «Ehi Mercedes»
+    // -------------------------------------------------------------------------------------------
+
+    /** Accende l'ascolto con l'auto collegata (se tutto è pronto), lo spegne altrimenti. */
+    private fun syncAssistant() {
+        val reason: String? = when {
+            !prefs.assistantEnabled -> ""
+            !BtUtils.hasRecordAudio(this) -> "Manca il permesso del microfono: aprilo dalla schermata dell'assistente."
+            !VoiceModel.isReady(this) -> "Scarica il modello vocale dalla schermata dell'assistente."
+            !fgsHasMic -> "Ascolto in pausa: apri l'app una volta per riattivarlo (Android lo richiede dopo un riavvio)."
+            !carConnected -> "Pronto: si attiva quando il telefono si collega all'auto."
+            else -> null
+        }
+        if (reason != null) {
+            assistant?.stop()
+            assistant = null
+            assistantInfo = reason
+            return
+        }
+        if (assistant == null) {
+            val a = VoiceAssistant(this, assistantCallbacks)
+            assistant = a
+            a.start()
+        }
+    }
+
+    private val assistantCallbacks = object : VoiceAssistant.Callbacks {
+        override fun onCommand(command: VoiceCommands.Command) {
+            val reply = when (command) {
+                VoiceCommands.Command.SPEED_LIMIT -> spokenLimitAnswer()
+                VoiceCommands.Command.UNKNOWN -> VoiceCommands.NOT_UNDERSTOOD
+            }
+            say(reply)
+        }
+
+        override fun onWakeOnly() {
+            say(VoiceCommands.ACK)
+        }
+
+        override fun onStatus(text: String) {
+            assistantInfo = text
+        }
+    }
+
+    /** Parla senza che l'assistente ascolti la propria voce. */
+    private fun say(text: String) {
+        val a = assistant
+        a?.pauseFor(ASSISTANT_REPLY_FAILSAFE_MS)
+        announcer.announce(text, 0L) { assistant?.resumeSoon() }
+    }
+
+    /** La risposta alla domanda "qual è il limite di questa strada?", con i dati del momento. */
+    fun spokenLimitAnswer(): String {
+        return VoiceCommands.speedLimitReply(
+            VoiceCommands.LimitState(
+                speedCheckEnabled = prefs.speedEnabled,
+                gpsActive = gpsActive && lastSpeedKmh >= 0f,
+                autoLimit = prefs.autoLimit,
+                detectedKmh = if (prefs.autoLimit) tracker.limitKmh else 0,
+                fromTag = tracker.fromTag,
+                roadName = tracker.roadName,
+                manualKmh = prefs.speedLimitKmh,
+                dataError = dataState == DATA_ERROR,
+                hasRoadData = roadData != null
+            )
+        )
+    }
+
+    // -------------------------------------------------------------------------------------------
     // Dov'è parcheggiata l'auto
     // -------------------------------------------------------------------------------------------
 
@@ -694,6 +809,12 @@ class CarAlertService : Service() {
             savedAtMs = wall
         )
         lastParkingSaveAt = nowElapsed
+
+        // nuovo parcheggio: si ricomincia a controllare il meteo in questo punto
+        prefs.carParked = true
+        prefs.weatherLastKey = ""
+        prefs.weatherStatus = ""
+        if (prefs.weatherAlertEnabled) WeatherScheduler.schedule(this, WEATHER_FIRST_CHECK_MS)
     }
 
     private fun bestParkingFix(): Location? {
@@ -862,6 +983,7 @@ class CarAlertService : Service() {
                     if (!overLimit) recorder?.noteOverspeed()
                     overLimit = true
                     lastAlarmAt = now
+                    assistant?.pauseFor(ASSISTANT_PAUSE_FOR_ALARM_MS)
                     player.play(SoundSynth.alarm(), prefs.volumePercent)
                 }
             }
