@@ -4,6 +4,8 @@ import android.content.Context
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.AutomaticGainControl
+import android.media.audiofx.NoiseSuppressor
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -142,7 +144,7 @@ object VoiceModel {
 class VoiceAssistant(context: Context, private val callbacks: Callbacks) {
 
     interface Callbacks {
-        /** È stato detto "Ehi Mercedes" seguito da una domanda (o la domanda dopo "Dimmi"). */
+        /** È stato detto "Ehi Mercedes" seguito da una domanda (o la domanda dopo "Dimmi"). UNKNOWN = non capita. */
         fun onCommand(command: VoiceCommands.Command)
 
         /** È stato detto solo "Ehi Mercedes": rispondere "Dimmi" e aspettare la domanda. */
@@ -154,8 +156,8 @@ class VoiceAssistant(context: Context, private val callbacks: Callbacks) {
     companion object {
         private const val SAMPLE_RATE = 16000
 
-        /** Dopo "Dimmi" si aspetta la domanda per questo tempo. */
-        private const val AWAIT_COMMAND_MS = 8_000L
+        /** Una frase più lunga di così (rumore continuo) viene scartata. */
+        private const val MAX_UTTERANCE_MS = 12_000L
     }
 
     private val appContext = context.applicationContext
@@ -171,7 +173,6 @@ class VoiceAssistant(context: Context, private val callbacks: Callbacks) {
     private var resetRequested = false
 
     private var thread: Thread? = null
-    private var awaitingUntil = 0L
 
     private val resume = Runnable {
         paused = false
@@ -213,10 +214,31 @@ class VoiceAssistant(context: Context, private val callbacks: Callbacks) {
         handler.post { if (running) block() }
     }
 
+    private val detector = WakeDetector()
+
+    /** Ascolta finché è acceso; se qualcosa si rompe riprova da solo dopo qualche secondo. */
     private fun loop() {
+        var attempt = 0
+        while (running) {
+            val outcome = listenOnce()
+            if (!running || outcome == Outcome.STOP) break
+            attempt += 1
+            val waitMs = minOf(30_000L, 3_000L * attempt)
+            try {
+                Thread.sleep(waitMs)
+            } catch (e: InterruptedException) {
+                break
+            }
+        }
+    }
+
+    private enum class Outcome { STOP, RETRY }
+
+    private fun listenOnce(): Outcome {
         var model: Model? = null
         var recognizer: Recognizer? = null
         var recorder: AudioRecord? = null
+        var effects: List<() -> Unit> = emptyList()
         try {
             post { callbacks.onStatus("Carico il modello vocale…") }
             model = Model(VoiceModel.dir(appContext).absolutePath)
@@ -234,21 +256,24 @@ class VoiceAssistant(context: Context, private val callbacks: Callbacks) {
             )
             recorder = rec
             if (rec.state != AudioRecord.STATE_INITIALIZED) {
-                post { callbacks.onStatus("Microfono non disponibile.") }
-                return
+                post { callbacks.onStatus("Microfono occupato o non disponibile: riprovo tra poco.") }
+                return Outcome.RETRY
             }
+            effects = enableAudioEffects(rec.audioSessionId)
             rec.startRecording()
             post { callbacks.onStatus("In ascolto: di' «Ehi Mercedes»") }
+            detector.reset()
 
             val buffer = ShortArray(SAMPLE_RATE / 5)   // 0,2 secondi
             var errors = 0
+            var utteranceStart = 0L
             while (running && !Thread.currentThread().isInterrupted) {
                 val n = rec.read(buffer, 0, buffer.size)
                 if (n < 0) {
                     errors += 1
                     if (errors > 50) {
-                        post { callbacks.onStatus("Il microfono ha smesso di funzionare: riprovo più tardi.") }
-                        break
+                        post { callbacks.onStatus("Il microfono ha smesso di funzionare: riprovo tra poco.") }
+                        return Outcome.RETRY
                     }
                     Thread.sleep(200L)
                     continue
@@ -257,24 +282,58 @@ class VoiceAssistant(context: Context, private val callbacks: Callbacks) {
                 if (paused || n == 0) continue
                 if (resetRequested) {
                     recognizer.reset()
+                    detector.reset()
                     resetRequested = false
+                    utteranceStart = 0L
                 }
-                if (recognizer.acceptWaveForm(buffer, n)) {
-                    val text = try {
-                        JSONObject(recognizer.getResult()).optString("text", "")
-                    } catch (e: Exception) {
-                        ""
+                val now = SystemClock.elapsedRealtime()
+                val action = if (recognizer.acceptWaveForm(buffer, n)) {
+                    utteranceStart = 0L
+                    detector.onFinal(textOf(recognizer.getResult(), "text"), now)
+                } else {
+                    val partial = textOf(recognizer.getPartialResult(), "partial")
+                    if (partial.isNotBlank()) {
+                        if (utteranceStart == 0L) utteranceStart = now
+                        // in mezzo al rumore la frase può non "finire" mai: dopo 12 s si ricomincia
+                        if (now - utteranceStart > MAX_UTTERANCE_MS) {
+                            recognizer.reset()
+                            detector.reset()
+                            utteranceStart = 0L
+                        }
                     }
-                    if (text.isNotBlank()) post { handleText(text) }
+                    detector.onPartial(partial, now)
+                }
+                if (!action.isNone) {
+                    // si riparte da zero, così la stessa frase non viene usata due volte
+                    recognizer.reset()
+                    utteranceStart = 0L
+                    when (action.kind) {
+                        WakeDetector.Kind.COMMAND -> post { callbacks.onCommand(action.command) }
+                        WakeDetector.Kind.WAKE_ONLY -> post { callbacks.onWakeOnly() }
+                        else -> {}
+                    }
                 }
             }
+            return Outcome.STOP
         } catch (e: InterruptedException) {
-            // fermato
+            return Outcome.STOP
         } catch (e: SecurityException) {
             post { callbacks.onStatus("Manca il permesso del microfono.") }
+            return Outcome.STOP
+        } catch (e: java.io.IOException) {
+            post { callbacks.onStatus("Il modello vocale è rovinato: cancellalo e scaricalo di nuovo.") }
+            return Outcome.STOP
         } catch (e: Throwable) {
-            post { callbacks.onStatus("Riconoscimento vocale non disponibile su questo telefono.") }
+            post { callbacks.onStatus("Riconoscimento vocale interrotto: riprovo tra poco.") }
+            return Outcome.RETRY
         } finally {
+            effects.forEach {
+                try {
+                    it()
+                } catch (e: Throwable) {
+                    // ignora
+                }
+            }
             try {
                 recorder?.stop()
             } catch (e: Exception) {
@@ -298,23 +357,40 @@ class VoiceAssistant(context: Context, private val callbacks: Callbacks) {
         }
     }
 
-    private fun handleText(text: String) {
-        val now = SystemClock.elapsedRealtime()
-        val afterWake = VoiceCommands.afterWakeWord(text)
-        if (afterWake != null) {
-            val command = VoiceCommands.parse(afterWake)
-            if (command != VoiceCommands.Command.UNKNOWN) {
-                awaitingUntil = 0L
-                callbacks.onCommand(command)
-            } else {
-                awaitingUntil = now + AWAIT_COMMAND_MS
-                callbacks.onWakeOnly()
+    private fun textOf(json: String?, key: String): String {
+        if (json.isNullOrBlank()) return ""
+        return try {
+            JSONObject(json).optString(key, "")
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
+    /** Riduzione del rumore (strada, motore, ventola) se il telefono la offre. Restituisce come spegnerla. */
+    private fun enableAudioEffects(sessionId: Int): List<() -> Unit> {
+        val off = ArrayList<() -> Unit>()
+        try {
+            if (NoiseSuppressor.isAvailable()) {
+                val ns = NoiseSuppressor.create(sessionId)
+                if (ns != null) {
+                    ns.setEnabled(true)
+                    off.add { ns.release() }
+                }
             }
-            return
+        } catch (e: Throwable) {
+            // non disponibile
         }
-        if (now < awaitingUntil) {
-            awaitingUntil = 0L
-            callbacks.onCommand(VoiceCommands.parse(text))
+        try {
+            if (AutomaticGainControl.isAvailable()) {
+                val agc = AutomaticGainControl.create(sessionId)
+                if (agc != null) {
+                    agc.setEnabled(true)
+                    off.add { agc.release() }
+                }
+            }
+        } catch (e: Throwable) {
+            // non disponibile
         }
+        return off
     }
 }

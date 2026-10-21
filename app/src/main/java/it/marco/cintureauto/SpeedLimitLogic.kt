@@ -22,7 +22,9 @@ class RoadWay(
     val maxspeedForward: String?,
     val maxspeedBackward: String?,
     val lats: DoubleArray,
-    val lons: DoubleArray
+    val lons: DoubleArray,
+    /** Tipo di limite scritto a parte (maxspeed:type, source:maxspeed, zone:maxspeed), es. "IT:urban". */
+    val zoneTag: String? = null
 )
 
 /**
@@ -35,7 +37,9 @@ class LimitMatch(
     val fromTag: Boolean,
     val roadName: String?,
     val highway: String,
-    val distanceM: Double
+    val distanceM: Double,
+    /** Per i limiti stimati: "centro abitato" o "fuori dal centro abitato" (null se non serve). */
+    val estimateNote: String? = null
 )
 
 object SpeedLimitLogic {
@@ -76,15 +80,57 @@ object SpeedLimitLogic {
     }
 
     /**
-     * Limite "di legge" da usare solo quando la strada non ha un limite scritto.
-     * Volutamente prudente: per le strade ordinarie non si può sapere se sono dentro o fuori
-     * dal centro abitato, quindi non si indovina (null = si usa il limite manuale).
+     * Limite "di legge" italiano da usare quando la strada non ha un limite scritto nei dati.
+     * Per le strade ordinarie dipende dal centro abitato: 50 dentro, 90 fuori (Codice della Strada,
+     * art. 142). È una stima, segnalata come tale.
      */
-    fun defaultForHighway(highway: String): Int? = when (highway) {
+    fun defaultForHighway(highway: String, urban: Boolean = false): Int? = when (highway) {
         "motorway" -> 130
-        "trunk" -> 110
+        "motorway_link" -> 80
+        "trunk" -> if (urban) 70 else 110
+        "trunk_link" -> if (urban) 50 else 70
+        "primary", "secondary", "tertiary", "unclassified",
+        "primary_link", "secondary_link", "tertiary_link" -> if (urban) 50 else 90
         "residential" -> 50
+        "living_street" -> 30
         else -> null
+    }
+
+    private val URBAN_HINT_TYPES = setOf("residential", "living_street")
+
+    /** Distanza minima (metri) tra il punto e un tratto di strada. */
+    private fun distanceToWay(way: RoadWay, lat: Double, lon: Double, kLat: Double, kLon: Double): Double {
+        val n = min(way.lats.size, way.lons.size)
+        if (n < 2) return Double.MAX_VALUE
+        var best = Double.MAX_VALUE
+        var px = (way.lons[0] - lon) * kLon
+        var py = (way.lats[0] - lat) * kLat
+        for (i in 1 until n) {
+            val x = (way.lons[i] - lon) * kLon
+            val y = (way.lats[i] - lat) * kLat
+            val d = distanceToSegment(px, py, x, y)
+            if (d < best) best = d
+            px = x
+            py = y
+        }
+        return best
+    }
+
+    /**
+     * Stima se il punto è in un centro abitato: ci sono almeno 3 vie residenziali nel raggio
+     * di 200 metri. In aperta campagna le vie residenziali sono rare.
+     */
+    fun looksUrban(ways: List<RoadWay>, lat: Double, lon: Double): Boolean {
+        val kLat = M_PER_DEG_LAT
+        val kLon = M_PER_DEG_LON_EQUATOR * cos(Math.toRadians(lat))
+        var count = 0
+        for (w in ways) {
+            if (w.highway in URBAN_HINT_TYPES && distanceToWay(w, lat, lon, kLat, kLon) <= 200.0) {
+                count += 1
+                if (count >= 3) return true
+            }
+        }
+        return false
     }
 
     fun distanceMeters(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
@@ -130,7 +176,7 @@ object SpeedLimitLogic {
     ): LimitMatch? {
         val kLat = M_PER_DEG_LAT
         val kLon = M_PER_DEG_LON_EQUATOR * cos(Math.toRadians(lat))
-        val maxDist = if (accuracyM > 0.0) (accuracyM * 1.5).coerceIn(20.0, 45.0) else 25.0
+        val maxDist = if (accuracyM > 0.0) (accuracyM * 1.5).coerceIn(25.0, 60.0) else 35.0
 
         var bestWay: RoadWay? = null
         var bestScore = Double.MAX_VALUE
@@ -185,13 +231,21 @@ object SpeedLimitLogic {
             limit = if (f != null && b != null) min(f, b) else (f ?: b)
         }
 
+        // 3) tipo di limite scritto a parte (es. "IT:urban" = centro abitato)
+        if (limit == null) limit = parseMaxspeed(way.zoneTag)
+
         var fromTag = limit != null
+        var note: String? = null
         if (limit == null) {
-            limit = defaultForHighway(way.highway)
+            val urban = way.highway in URBAN_HINT_TYPES || looksUrban(ways, lat, lon)
+            limit = defaultForHighway(way.highway, urban)
+            if (limit != null && way.highway !in setOf("motorway", "residential", "living_street")) {
+                note = if (urban) "centro abitato" else "fuori dal centro abitato"
+            }
         }
         if (limit == null) fromTag = false
 
-        return LimitMatch(limit, fromTag, way.name, way.highway, bestDist)
+        return LimitMatch(limit, fromTag, way.name, way.highway, bestDist, note)
     }
 }
 
@@ -212,6 +266,10 @@ class LimitTracker(
 
     /** True se il limite è scritto nei dati, false se dedotto dal tipo di strada. */
     var fromTag: Boolean = false
+        private set
+
+    /** Per i limiti stimati: "centro abitato" / "fuori dal centro abitato". */
+    var estimateNote: String? = null
         private set
 
     /** True se una strada è stata riconosciuta di recente. */
@@ -242,6 +300,7 @@ class LimitTracker(
             candidateCount = 0
             roadName = match.roadName
             fromTag = match.fromTag
+            estimateNote = match.estimateNote
             return false
         }
 
@@ -258,6 +317,7 @@ class LimitTracker(
         limitKmh = 0
         roadName = null
         fromTag = false
+        estimateNote = null
         hasRoad = false
         candidate = -1
         candidateCount = 0
@@ -269,6 +329,7 @@ class LimitTracker(
         limitKmh = value
         roadName = match.roadName
         fromTag = match.fromTag
+        estimateNote = match.estimateNote
         candidate = -1
         candidateCount = 0
         return changed

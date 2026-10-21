@@ -68,7 +68,8 @@ object WeatherCheck {
         return status
     }
 
-    private fun download(url: String): String? {
+    /** Scarica un testo da internet (null se non risponde). Da un thread in background. */
+    fun download(url: String): String? {
         var conn: HttpURLConnection? = null
         return try {
             conn = URI(url).toURL().openConnection() as HttpURLConnection
