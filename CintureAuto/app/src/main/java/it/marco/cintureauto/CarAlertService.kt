@@ -13,6 +13,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.location.Geocoder
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
@@ -24,6 +25,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
+import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -62,15 +64,15 @@ class CarAlertService : Service() {
 
         /** Oltre questa velocità si scarica un'area più grande (meno richieste in autostrada). */
         private const val FAST_KMH = 80f
-        private const val RADIUS_SLOW_M = 450
-        private const val RADIUS_FAST_M = 900
+        private const val RADIUS_SLOW_M = 1000
+        private const val RADIUS_FAST_M = 1800
 
         /** Si scaricano nuovi dati quando ci si allontana dal centro di più di questa frazione del raggio. */
-        private const val REFETCH_FRACTION = 0.6
+        private const val REFETCH_FRACTION = 0.5
 
         /** Pausa minima tra due richieste riuscite, e attesa dopo una richiesta fallita. */
         private const val MIN_FETCH_GAP_MS = 8_000L
-        private const val RETRY_MS = 60_000L
+        private const val RETRY_MS = 20_000L
 
         /** La direzione del GPS è affidabile solo se ci si muove abbastanza in fretta. */
         private const val MIN_HEADING_KMH = 8f
@@ -96,6 +98,14 @@ class CarAlertService : Service() {
         /** Il Bluetooth può mandare due volte lo stesso evento: si salva una sola volta. */
         private const val PARKING_DEDUPE_MS = 15_000L
 
+        // ---- assistente vocale ----
+        private const val ASSISTANT_PAUSE_FOR_CHIME_MS = 9_000L
+        private const val ASSISTANT_PAUSE_FOR_ALARM_MS = 2_500L
+        private const val ASSISTANT_REPLY_FAILSAFE_MS = 15_000L
+
+        // ---- meteo ----
+        private const val WEATHER_FIRST_CHECK_MS = 60_000L
+
         private const val DATA_NONE = 0
         private const val DATA_OK = 1
         private const val DATA_ERROR = 2
@@ -109,6 +119,10 @@ class CarAlertService : Service() {
         /** Descrizione del limite in uso, mostrata nella schermata principale. */
         @Volatile
         var limitInfo: String = ""
+
+        /** Stato dell'assistente vocale, mostrato nella schermata principale. */
+        @Volatile
+        var assistantInfo: String = ""
 
         /** Aumenta ogni volta che l'elenco dei viaggi cambia: la schermata lo usa per aggiornarsi. */
         @Volatile
@@ -161,6 +175,13 @@ class CarAlertService : Service() {
     var fgsHasLocation: Boolean = true
         private set
 
+    /** Vero se il servizio può usare il microfono anche a schermo spento (assistente vocale). */
+    @Volatile
+    var fgsHasMic: Boolean = false
+        private set
+
+    private var assistant: VoiceAssistant? = null
+
     private var pendingChime: Runnable? = null
     private var lastChimeAt: Long = -1L
 
@@ -180,6 +201,7 @@ class CarAlertService : Service() {
 
     // ---- stato del limite automatico ----
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val voiceExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val tracker = LimitTracker()
     private var roadData: RoadData? = null
     private var fetchInFlight = false
@@ -232,6 +254,9 @@ class CarAlertService : Service() {
 
     override fun onDestroy() {
         destroyed = true
+        assistant?.stop()
+        assistant = null
+        assistantInfo = ""
         finishTrip()
         stopGps()
         cancelPendingChime()
@@ -246,6 +271,7 @@ class CarAlertService : Service() {
         player.stop()
         announcer.shutdown()
         executor.shutdownNow()
+        voiceExecutor.shutdownNow()
         lastSpeedKmh = -1f
         limitInfo = ""
         instance = null
@@ -259,7 +285,7 @@ class CarAlertService : Service() {
     private fun createChannel() {
         val channel = NotificationChannel(
             CHANNEL_ID,
-            "Servizio Cinture Auto",
+            "Servizio My Mercedes",
             NotificationManager.IMPORTANCE_LOW
         )
         channel.description = "Notifica fissa che tiene attiva l'app in background"
@@ -279,6 +305,24 @@ class CarAlertService : Service() {
                 false
             }
         }
+
+        // 0) Con l'assistente vocale: posizione + microfono. Android lo permette solo se il servizio
+        //    parte mentre l'app è aperta sullo schermo; altrimenti si ripiega sui casi sotto.
+        if (prefs.assistantEnabled && BtUtils.hasRecordAudio(this)) {
+            try {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                )
+                fgsHasLocation = true
+                fgsHasMic = true
+                return true
+            } catch (e: Exception) {
+                // non consentito adesso: si continua senza microfono
+            }
+        }
+        fgsHasMic = false
 
         // 1) Modalità completa: "posizione" (GPS a schermo spento) + Bluetooth.
         try {
@@ -316,7 +360,7 @@ class CarAlertService : Service() {
         )
         return Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_belt)
-            .setContentTitle("Cinture Auto attiva")
+            .setContentTitle("My Mercedes attiva")
             .setContentText(statusText())
             .setContentIntent(openIntent)
             .setOngoing(true)
@@ -429,6 +473,10 @@ class CarAlertService : Service() {
 
     private fun onCarConnected() {
         carConnected = true
+        // l'auto non è più parcheggiata: niente più controlli meteo
+        prefs.carParked = false
+        WeatherScheduler.cancel(this)
+        WeatherNotifier.dismiss(this)
         resetSpeedState()
         updateGpsState()
 
@@ -502,6 +550,7 @@ class CarAlertService : Service() {
         val phrase = prefs.voicePhrase.trim().ifEmpty { Prefs.DEFAULT_PHRASE }
         val speak: () -> Unit = { announcer.announce(phrase, VOICE_GAP_MS) }
 
+        assistant?.pauseFor(ASSISTANT_PAUSE_FOR_CHIME_MS)
         if (prefs.chimeEnabled) {
             player.play(
                 SoundSynth.chime(prefs.chimeStyle),
@@ -545,6 +594,7 @@ class CarAlertService : Service() {
             stopGps()
         }
         syncTrip()
+        syncAssistant()
         updateNotification()
     }
 
@@ -597,9 +647,10 @@ class CarAlertService : Service() {
         previousLocation = location
         lastFix = location
         feedTrip(location, kmh)
-        if (!prefs.speedEnabled) return
 
-        if (prefs.autoLimit) updateAutoLimit(location, kmh)
+        // Il limite della strada serve all'avviso di velocità e alle risposte di «Ehi Mercedes»
+        if (prefs.autoLimit && (prefs.speedEnabled || prefs.assistantEnabled)) updateAutoLimit(location, kmh)
+        if (!prefs.speedEnabled) return
         limitInfo = describeLimit()
         evaluateSpeed(kmh)
     }
@@ -673,6 +724,124 @@ class CarAlertService : Service() {
     }
 
     // -------------------------------------------------------------------------------------------
+    // Assistente vocale «Ehi Mercedes»
+    // -------------------------------------------------------------------------------------------
+
+    /** Accende l'ascolto con l'auto collegata (se tutto è pronto), lo spegne altrimenti. */
+    private fun syncAssistant() {
+        val reason: String? = when {
+            !prefs.assistantEnabled -> ""
+            !BtUtils.hasRecordAudio(this) -> "Manca il permesso del microfono: aprilo dalla schermata dell'assistente."
+            !VoiceModel.isReady(this) -> "Scarica il modello vocale dalla schermata dell'assistente."
+            !fgsHasMic -> "Ascolto in pausa: apri l'app una volta per riattivarlo (Android lo richiede dopo un riavvio)."
+            !carConnected -> "Pronto: si attiva quando il telefono si collega all'auto."
+            else -> null
+        }
+        if (reason != null) {
+            assistant?.stop()
+            assistant = null
+            assistantInfo = reason
+            return
+        }
+        if (assistant == null) {
+            val a = VoiceAssistant(this, assistantCallbacks)
+            assistant = a
+            a.start()
+        }
+    }
+
+    private val assistantCallbacks = object : VoiceAssistant.Callbacks {
+        override fun onCommand(command: VoiceCommands.Command) {
+            val reply = when (command) {
+                VoiceCommands.Command.SPEED_LIMIT -> spokenLimitAnswer()
+                VoiceCommands.Command.WEATHER_TODAY -> {
+                    answerWeather(tomorrow = false)
+                    return
+                }
+                VoiceCommands.Command.WEATHER_TOMORROW -> {
+                    answerWeather(tomorrow = true)
+                    return
+                }
+                VoiceCommands.Command.UNKNOWN -> VoiceCommands.NOT_UNDERSTOOD
+            }
+            say(reply)
+        }
+
+        override fun onWakeOnly() {
+            say(VoiceCommands.ACK)
+        }
+
+        override fun onStatus(text: String) {
+            assistantInfo = text
+        }
+    }
+
+    /** "Che tempo fa?": previsione Open-Meteo nel punto in cui ti trovi (dal GPS). */
+    private fun answerWeather(tomorrow: Boolean) {
+        val here = lastFix ?: lastKnown(LocationManager.GPS_PROVIDER) ?: lastKnown(LocationManager.NETWORK_PROVIDER)
+        if (here == null) {
+            say("Non ho ancora la tua posizione GPS, quindi non so per quale zona darti il meteo.")
+            return
+        }
+        assistant?.pauseFor(ASSISTANT_REPLY_FAILSAFE_MS)
+        val lat = here.latitude
+        val lon = here.longitude
+        try {
+            voiceExecutor.execute {
+                val outlook = WeatherCheck.download(WeatherLogic.buildOutlookUrl(lat, lon))
+                    ?.let { WeatherLogic.parseOutlook(it) }
+                val place = if (outlook != null) placeName(lat, lon) else null
+                val reply = if (outlook == null) {
+                    "Non riesco a scaricare le previsioni del tempo in questo momento. Controlla la connessione."
+                } else {
+                    WeatherLogic.spokenOutlook(outlook, place, tomorrow)
+                }
+                handler.post { if (!destroyed) say(reply) }
+            }
+        } catch (e: Exception) {
+            say("Non riesco a controllare il meteo adesso.")
+        }
+    }
+
+    /** Nome del paese o della città (dal servizio di geolocalizzazione del telefono), se disponibile. */
+    @Suppress("DEPRECATION")
+    private fun placeName(lat: Double, lon: Double): String? {
+        return try {
+            if (!Geocoder.isPresent()) return null
+            val list = Geocoder(this, Locale.ITALY).getFromLocation(lat, lon, 1)
+            val a = list?.firstOrNull() ?: return null
+            a.locality ?: a.subAdminArea
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** Parla senza che l'assistente ascolti la propria voce. */
+    private fun say(text: String) {
+        val a = assistant
+        a?.pauseFor(ASSISTANT_REPLY_FAILSAFE_MS)
+        announcer.announce(text, 0L) { assistant?.resumeSoon() }
+    }
+
+    /** La risposta alla domanda "qual è il limite di questa strada?", con i dati del momento. */
+    fun spokenLimitAnswer(): String {
+        return VoiceCommands.speedLimitReply(
+            VoiceCommands.LimitState(
+                speedCheckEnabled = prefs.speedEnabled || prefs.assistantEnabled,
+                gpsActive = gpsActive && lastSpeedKmh >= 0f,
+                autoLimit = prefs.autoLimit,
+                detectedKmh = if (prefs.autoLimit) tracker.limitKmh else 0,
+                fromTag = tracker.fromTag,
+                estimateNote = tracker.estimateNote,
+                roadName = tracker.roadName,
+                manualKmh = prefs.speedLimitKmh,
+                dataError = dataState == DATA_ERROR,
+                hasRoadData = roadData != null
+            )
+        )
+    }
+
+    // -------------------------------------------------------------------------------------------
     // Dov'è parcheggiata l'auto
     // -------------------------------------------------------------------------------------------
 
@@ -694,6 +863,12 @@ class CarAlertService : Service() {
             savedAtMs = wall
         )
         lastParkingSaveAt = nowElapsed
+
+        // nuovo parcheggio: si ricomincia a controllare il meteo in questo punto
+        prefs.carParked = true
+        prefs.weatherLastKey = ""
+        prefs.weatherStatus = ""
+        if (prefs.weatherAlertEnabled) WeatherScheduler.schedule(this, WEATHER_FIRST_CHECK_MS)
     }
 
     private fun bestParkingFix(): Location? {
@@ -785,9 +960,16 @@ class CarAlertService : Service() {
         ) > data.radiusM * REFETCH_FRACTION
         if (!needed) return
 
-        val lat = location.latitude
-        val lon = location.longitude
         val radius = if (kmh >= FAST_KMH) RADIUS_FAST_M else RADIUS_SLOW_M
+        // L'area si scarica un po' più avanti nella direzione di marcia: dura di più
+        var lat = location.latitude
+        var lon = location.longitude
+        if (location.hasBearing() && kmh >= 30f) {
+            val shiftM = radius * 0.45
+            val b = Math.toRadians(location.bearing.toDouble())
+            lat += shiftM * Math.cos(b) / 111_132.0
+            lon += shiftM * Math.sin(b) / (111_320.0 * Math.cos(Math.toRadians(lat)))
+        }
 
         fetchInFlight = true
         try {
@@ -831,7 +1013,11 @@ class CarAlertService : Service() {
         val detected = tracker.limitKmh
         if (detected > 0) {
             val road = tracker.roadName?.let { " · $it" } ?: ""
-            val kind = if (tracker.fromTag) "" else " (stimato dal tipo di strada)"
+            val kind = when {
+                tracker.fromTag -> ""
+                tracker.estimateNote != null -> " (stimato: ${tracker.estimateNote})"
+                else -> " (stimato dal tipo di strada)"
+            }
             return "Limite rilevato: $detected km/h$road$kind · avviso oltre ${detected + tolerance} km/h"
         }
 
@@ -862,6 +1048,7 @@ class CarAlertService : Service() {
                     if (!overLimit) recorder?.noteOverspeed()
                     overLimit = true
                     lastAlarmAt = now
+                    assistant?.pauseFor(ASSISTANT_PAUSE_FOR_ALARM_MS)
                     player.play(SoundSynth.alarm(), prefs.volumePercent)
                 }
             }

@@ -21,6 +21,7 @@ import android.provider.Settings
 import android.text.Editable
 import android.text.TextWatcher
 import android.util.TypedValue
+import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.AdapterView
@@ -46,6 +47,11 @@ class MainActivity : Activity() {
         private const val REQ_BASIC = 1
         private const val REQ_BG = 2
         private const val REQ_EXPORT = 3
+        private const val REQ_MIC = 4
+
+        private const val HOME = "home"
+        private val COLOR_HEADER = Color.parseColor("#1B1F26")
+        private val COLOR_HEADER_TEXT = Color.parseColor("#D9DEE5")
 
         private val COLOR_BG = Color.parseColor("#F2F4F8")
         private val COLOR_TEXT = Color.parseColor("#1B2430")
@@ -61,6 +67,13 @@ class MainActivity : Activity() {
     private val testPlayer by lazy { SoundPlayer(this) }
 
     private lateinit var root: LinearLayout
+    private lateinit var scrollView: ScrollView
+
+    // Sezioni: la schermata principale con le icone e una pagina per ogni funzione
+    private val sections = LinkedHashMap<String, LinearLayout>()
+    private var target: LinearLayout? = null
+    private var currentSection = HOME
+    private lateinit var statusVoice: TextView
     private lateinit var statusService: TextView
     private lateinit var statusCar: TextView
     private lateinit var statusSpeed: TextView
@@ -73,6 +86,8 @@ class MainActivity : Activity() {
     private lateinit var parkingInfo: TextView
     private lateinit var tripsSummary: TextView
     private lateinit var tripsRecent: TextView
+    private lateinit var weatherInfo: TextView
+    private lateinit var assistantInfo: TextView
     private val tripStore by lazy { TripStore(this) }
     private var tripsCache: List<Trip> = emptyList()
     private var tripsCacheVersion = -1
@@ -115,7 +130,9 @@ class MainActivity : Activity() {
         if (prefs.serviceEnabled && hasBasicPermissions()) {
             val svc = CarAlertService.instance
             // Riavvia il servizio se non c'è, oppure se era partito in modalità ridotta (senza GPS).
-            if (svc == null || !svc.fgsHasLocation) CarAlertService.start(this)
+            // (o senza microfono, se l'assistente vocale è acceso: Android lo concede solo ad app aperta).
+            val needsMic = prefs.assistantEnabled && hasRecordAudio() && svc != null && !svc.fgsHasMic
+            if (svc == null || !svc.fgsHasLocation || needsMic) CarAlertService.start(this)
         }
         reloadTrips()
         handler.removeCallbacks(ticker)
@@ -140,6 +157,7 @@ class MainActivity : Activity() {
 
     private fun buildUi() {
         val scroll = ScrollView(this)
+        scrollView = scroll
         scroll.setBackgroundColor(COLOR_BG)
 
         root = LinearLayout(this)
@@ -154,21 +172,28 @@ class MainActivity : Activity() {
         )
         setContentView(scroll)
 
-        root.addView(label("Cinture Auto", 28f, Typeface.BOLD, COLOR_TEXT))
-        root.addView(
+        // ---- Schermata principale ----
+        section(HOME, null)
+        val header = LinearLayout(this)
+        header.orientation = LinearLayout.VERTICAL
+        header.setPadding(dp(18), dp(18), dp(18), dp(18))
+        header.background = roundedBg(COLOR_HEADER)
+        header.addView(label("🚗  My Mercedes", 26f, Typeface.BOLD, Color.WHITE))
+        header.addView(
             label(
-                "Il \"ding\" delle cinture appena ti colleghi all'auto, un avviso quando superi il limite, la posizione dell'auto parcheggiata e il registro dei tuoi viaggi.",
-                14f, Typeface.NORMAL, COLOR_MUTED
+                "Cinture, limiti di velocità, parcheggio, viaggi, meteo e «Ehi Mercedes».",
+                13f, Typeface.NORMAL, COLOR_HEADER_TEXT
             )
         )
+        (target ?: root).addView(header)
 
-        // ---- Stato ----
         val statusCard = card("Stato")
         statusService = addLine(statusCard)
         statusCar = addLine(statusCard)
         statusSpeed = addLine(statusCard)
         statusLimit = addLine(statusCard)
         statusTrip = addLine(statusCard)
+        statusVoice = addLine(statusCard)
         statusPerms = addLine(statusCard)
         switchRow(statusCard, "Servizio sempre attivo", prefs.serviceEnabled) { checked ->
             onServiceSwitch(checked)
@@ -178,7 +203,23 @@ class MainActivity : Activity() {
             "Tienilo acceso: l'app resta attiva in background (vedrai una notifica fissa) e riparte da sola quando accendi il telefono."
         )
 
+        val tiles = card("Funzioni")
+        tileGrid(
+            tiles,
+            listOf(
+                Triple("parcheggio", "📍", "Parcheggio"),
+                Triple("velocita", "🚦", "Limite di velocità"),
+                Triple("assistente", "🎙️", "Ehi Mercedes"),
+                Triple("meteo", "⛅", "Meteo"),
+                Triple("viaggi", "📒", "Viaggi"),
+                Triple("suono", "🔔", "Suono e voce"),
+                Triple("auto", "🚘", "Auto"),
+                Triple("permessi", "🔐", "Permessi")
+            )
+        )
+
         // ---- Auto ----
+        section("auto", "🚘  Auto")
         val carCard = card("Auto")
         note(carCard, "Nome Bluetooth dell'auto, come appare nell'elenco dei dispositivi del telefono:")
         carNameInput = EditText(this)
@@ -197,6 +238,7 @@ class MainActivity : Activity() {
         actionButton(carCard, "Scegli tra i dispositivi già associati") { pickPairedDevice() }
 
         // ---- Suono cintura ----
+        section("suono", "🔔  Suono e voce")
         val chimeCard = card("Suono cintura")
         switchRow(chimeCard, "Suona quando mi collego all'auto", prefs.chimeEnabled) { checked ->
             prefs.chimeEnabled = checked
@@ -260,6 +302,7 @@ class MainActivity : Activity() {
         actionButton(voiceCard, "Impostazioni di sintesi vocale del telefono") { openTtsSettings() }
 
         // ---- Avviso velocità ----
+        section("velocita", "🚦  Limite di velocità")
         val speedCard = card("Avviso di velocità")
         switchRow(speedCard, "Avvisami se supero il limite", prefs.speedEnabled) { checked ->
             prefs.speedEnabled = checked
@@ -311,6 +354,7 @@ class MainActivity : Activity() {
         note(speedCard, "Dati delle strade: © OpenStreetMap contributors.")
 
         // ---- Parcheggio ----
+        section("parcheggio", "📍  Parcheggio")
         val parkingCard = card("Dov'è parcheggiata l'auto")
         switchRow(parkingCard, "Salva la posizione quando scendo dall'auto", prefs.parkingEnabled) { checked ->
             prefs.parkingEnabled = checked
@@ -328,7 +372,44 @@ class MainActivity : Activity() {
                 "I pulsanti aprono l'app di mappe del telefono (o Google Maps nel browser)."
         )
 
+        // ---- Meteo ----
+        section("meteo", "⛅  Meteo")
+        val weatherCard = card("Allerta meteo per l'auto parcheggiata")
+        switchRow(weatherCard, "Avvisami di grandine o gelata dove ho parcheggiato", prefs.weatherAlertEnabled) { checked ->
+            prefs.weatherAlertEnabled = checked
+            if (checked && prefs.carParked) WeatherScheduler.schedule(this, 5_000L) else WeatherScheduler.cancel(this)
+            refreshStatus()
+        }
+        weatherInfo = addLine(weatherCard)
+        actionButton(weatherCard, "Controlla adesso") { checkWeatherNow() }
+        note(
+            weatherCard,
+            "Mentre l'auto è parcheggiata, ogni 2 ore il telefono chiede la previsione per quel punto. " +
+                "Se nelle prossime 18 ore sono previsti grandine o temperature sotto zero di notte, ricevi una notifica urgente " +
+                "con suono. Viene inviata solo la posizione approssimata (circa 1 km). Previsioni: Open-Meteo.com (CC BY 4.0). " +
+                "La previsione della grandine è indicativa: non intercetta tutti i temporali."
+        )
+
+        // ---- Assistente vocale ----
+        section("assistente", "🎙️  Ehi Mercedes")
+        val assistantCard = card("Assistente vocale «Ehi Mercedes» (sperimentale)")
+        switchRow(assistantCard, "Ascolta «Ehi Mercedes» quando sono in auto", prefs.assistantEnabled) { checked ->
+            onAssistantSwitch(checked)
+        }
+        assistantInfo = addLine(assistantCard)
+        actionButton(assistantCard, "Scarica il modello vocale italiano (circa 50 MB)") { downloadVoiceModel() }
+        actionButton(assistantCard, "▶  Prova la risposta sul limite") { testLimitAnswer() }
+        note(
+            assistantCard,
+            "Con l'auto collegata di' «Ehi Mercedes, qual è il limite di velocità?» oppure «Ehi Mercedes, che tempo fa oggi?» " +
+                "(o «…domani?»). Puoi anche dire solo «Ehi Mercedes», aspettare «Dimmi» e poi chiedere. " +
+                "Il riconoscimento avviene solo sul telefono: l'audio non viene inviato a nessuno. " +
+                "Il modello vocale si scarica una volta (meglio con il Wi-Fi). Il microfono resta acceso finché l'auto è collegata: " +
+                "consuma un po' di batteria. Dopo un riavvio del telefono apri l'app una volta per riattivare l'ascolto."
+        )
+
         // ---- Registro dei viaggi ----
+        section("viaggi", "📒  Viaggi")
         val tripsCard = card("Registro dei viaggi")
         switchRow(tripsCard, "Registra i miei viaggi", prefs.tripLogEnabled) { checked ->
             prefs.tripLogEnabled = checked
@@ -348,6 +429,7 @@ class MainActivity : Activity() {
         )
 
         // ---- Volume ----
+        section("suono", null)
         val volumeCard = card("Volume")
         seekRow(volumeCard, { "Volume dei suoni dell'app: $it%" }, 20, 100, 5, prefs.volumePercent) {
             prefs.volumePercent = it
@@ -358,6 +440,7 @@ class MainActivity : Activity() {
         )
 
         // ---- Permessi e affidabilità ----
+        section("permessi", "🔐  Permessi")
         val permCard = card("Permessi e affidabilità")
         note(
             permCard,
@@ -373,6 +456,9 @@ class MainActivity : Activity() {
             permCard,
             "Su alcuni telefoni (Xiaomi, Huawei, Oppo, Samsung) nel passaggio 4 va attivato anche «Avvio automatico» e la batteria dell'app va messa su «Nessuna restrizione»."
         )
+
+        target = null
+        showSection(HOME)
     }
 
     // -------------------------------------------------------------------------------------------
@@ -409,9 +495,84 @@ class MainActivity : Activity() {
             ViewGroup.LayoutParams.WRAP_CONTENT
         )
         lp.topMargin = dp(14)
-        root.addView(c, lp)
+        (target ?: root).addView(c, lp)
         c.addView(label(title, 17f, Typeface.BOLD, COLOR_ACCENT))
         return c
+    }
+
+    /**
+     * Da qui in poi le schede vanno nella sezione [key] (creata se non esiste).
+     * [title] non nullo = nuova pagina con il pulsante «Indietro» in alto.
+     */
+    private fun section(key: String, title: String?) {
+        val existing = sections[key]
+        if (existing != null) {
+            target = existing
+            return
+        }
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        box.visibility = View.GONE
+        root.addView(
+            box,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        )
+        sections[key] = box
+        target = box
+        if (title != null) {
+            val back = Button(this)
+            back.text = "←  Indietro"
+            back.isAllCaps = false
+            back.setOnClickListener { showSection(HOME) }
+            box.addView(back, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            box.addView(label(title, 24f, Typeface.BOLD, COLOR_TEXT))
+        }
+    }
+
+    private fun showSection(key: String) {
+        currentSection = key
+        for ((k, v) in sections) v.visibility = if (k == key) View.VISIBLE else View.GONE
+        scrollView.scrollTo(0, 0)
+        refreshStatus()
+    }
+
+    /** Griglia di icone (3 per riga) che aprono le funzioni. */
+    private fun tileGrid(parent: LinearLayout, items: List<Triple<String, String, String>>) {
+        var row: LinearLayout? = null
+        items.forEachIndexed { i, (key, icon, text) ->
+            if (i % 3 == 0) {
+                val r = LinearLayout(this)
+                r.orientation = LinearLayout.HORIZONTAL
+                parent.addView(r, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+                row = r
+            }
+            val tile = LinearLayout(this)
+            tile.orientation = LinearLayout.VERTICAL
+            tile.gravity = Gravity.CENTER
+            tile.setPadding(dp(6), dp(14), dp(6), dp(14))
+            tile.background = roundedBg(COLOR_BG)
+            tile.isClickable = true
+            tile.setOnClickListener { showSection(key) }
+            val iconView = label(icon, 30f, Typeface.NORMAL, COLOR_TEXT)
+            iconView.gravity = Gravity.CENTER
+            val textView = label(text, 13f, Typeface.BOLD, COLOR_TEXT)
+            textView.gravity = Gravity.CENTER
+            tile.addView(iconView)
+            tile.addView(textView)
+            val lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            lp.setMargins(dp(4), dp(4), dp(4), dp(4))
+            row?.addView(tile, lp)
+        }
+        // completa l'ultima riga con spazi vuoti, così le icone restano allineate
+        val rest = (3 - items.size % 3) % 3
+        repeat(rest) {
+            row?.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (currentSection != HOME) showSection(HOME) else super.onBackPressed()
     }
 
     private fun addLine(parent: LinearLayout): TextView {
@@ -544,8 +705,18 @@ class MainActivity : Activity() {
             statusTrip.visibility = View.GONE
         }
 
+        if (prefs.assistantEnabled) {
+            val info = if (svc != null) CarAlertService.assistantInfo else ""
+            statusVoice.text = "🎙️ Ehi Mercedes: " + info.ifEmpty { "in preparazione" }
+            statusVoice.visibility = View.VISIBLE
+        } else {
+            statusVoice.visibility = View.GONE
+        }
+
         if (tripsCacheVersion != CarAlertService.tripsVersion) reloadTrips()
         renderParking(svc)
+        renderWeather()
+        renderAssistant(svc)
 
         val loc = hasFineLocation()
         val bg = hasBackgroundLocation()
@@ -681,7 +852,7 @@ class MainActivity : Activity() {
                 .setData(Uri.parse("package:$packageName"))
             startActivity(intent)
         } catch (e: Exception) {
-            toast("Apri le impostazioni del telefono → App → Cinture Auto.")
+            toast("Apri le impostazioni del telefono → App → My Mercedes.")
         }
     }
 
@@ -696,6 +867,15 @@ class MainActivity : Activity() {
                 if (prefs.serviceEnabled) afterBasicPermissions()
                 refreshStatus()
             }
+            REQ_MIC -> {
+                if (hasRecordAudio()) {
+                    if (prefs.serviceEnabled) CarAlertService.start(this)
+                    if (!VoiceModel.isReady(this)) downloadVoiceModel()
+                } else {
+                    toast("Senza il permesso del microfono l'assistente vocale non può ascoltare.")
+                }
+                refreshStatus()
+            }
             REQ_BG -> {
                 if (prefs.serviceEnabled) {
                     // riavvia il servizio: ora può ottenere la posizione anche in background
@@ -705,6 +885,102 @@ class MainActivity : Activity() {
                 refreshStatus()
             }
         }
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // Meteo
+    // -------------------------------------------------------------------------------------------
+
+    private fun renderWeather() {
+        val text = when {
+            !prefs.weatherAlertEnabled -> "Disattivata."
+            !prefs.carParked -> "Si attiva quando parcheggi (alla disconnessione del Bluetooth)."
+            prefs.weatherStatus.isNotEmpty() -> prefs.weatherStatus
+            else -> "Auto parcheggiata: primo controllo entro pochi minuti."
+        }
+        if (weatherInfo.text.toString() != text) weatherInfo.text = text
+    }
+
+    private fun checkWeatherNow() {
+        if (prefs.parkingSpot == null) {
+            toast("Nessuna posizione di parcheggio salvata.")
+            return
+        }
+        toast("Controllo la previsione…")
+        val app = applicationContext
+        Thread {
+            // il controllo manuale vale anche con l'auto collegata, senza cambiare la pianificazione
+            val wasParked = prefs.carParked
+            if (!wasParked) prefs.carParked = true
+            val result = WeatherCheck.run(app, reschedule = wasParked)
+            if (!wasParked) prefs.carParked = false
+            handler.post {
+                toast(result)
+                refreshStatus()
+            }
+        }.start()
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // Assistente vocale
+    // -------------------------------------------------------------------------------------------
+
+    private fun hasRecordAudio(): Boolean = granted(Manifest.permission.RECORD_AUDIO)
+
+    private fun onAssistantSwitch(checked: Boolean) {
+        prefs.assistantEnabled = checked
+        if (checked) {
+            if (!hasRecordAudio()) {
+                requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQ_MIC)
+                return
+            }
+            if (!VoiceModel.isReady(this)) downloadVoiceModel()
+        }
+        // il servizio riparte con (o senza) il microfono
+        if (prefs.serviceEnabled) CarAlertService.start(this)
+        CarAlertService.instance?.refresh()
+        refreshStatus()
+    }
+
+    private fun renderAssistant(svc: CarAlertService?) {
+        val text = when {
+            VoiceModel.downloading -> VoiceModel.progressText
+            !prefs.assistantEnabled -> "Spento."
+            !hasRecordAudio() -> "Manca il permesso del microfono: spegni e riaccendi l'interruttore."
+            !VoiceModel.isReady(this) ->
+                VoiceModel.progressText.ifEmpty { "Manca il modello vocale: tocca «Scarica il modello vocale»." }
+            svc == null -> "Il servizio non è attivo."
+            else -> CarAlertService.assistantInfo.ifEmpty { "In preparazione…" }
+        }
+        if (assistantInfo.text.toString() != text) assistantInfo.text = text
+    }
+
+    private fun downloadVoiceModel() {
+        if (VoiceModel.downloading) {
+            toast("Download già in corso.")
+            return
+        }
+        if (VoiceModel.isReady(this)) {
+            toast("Il modello vocale è già sul telefono.")
+            return
+        }
+        val app = applicationContext
+        Thread {
+            val ok = VoiceModel.download(app)
+            handler.post {
+                toast(if (ok) "Modello vocale pronto." else VoiceModel.progressText)
+                if (ok) CarAlertService.instance?.refresh()
+                refreshStatus()
+            }
+        }.start()
+        refreshStatus()
+    }
+
+    private fun testLimitAnswer() {
+        val answer = CarAlertService.instance?.spokenLimitAnswer()
+            ?: "Il servizio non è attivo, quindi non conosco la strada."
+        toast(answer)
+        announcerInstance?.announce(answer, 0L)
     }
 
     // -------------------------------------------------------------------------------------------
@@ -783,6 +1059,8 @@ class MainActivity : Activity() {
 
     private fun clearParking() {
         prefs.parkingSpot = null
+        prefs.carParked = false
+        WeatherScheduler.cancel(this)
         toast("Posizione cancellata.")
         refreshStatus()
     }

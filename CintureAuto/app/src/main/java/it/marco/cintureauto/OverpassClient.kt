@@ -27,19 +27,25 @@ object OverpassClient {
     // comunità OpenStreetMap, che chiede un uso moderato (usato solo come ripiego).
     private val ENDPOINTS = listOf(
         "https://overpass.private.coffee/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+        "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
         "https://overpass-api.de/api/interpreter"
     )
+
+    /** Si riparte dall'ultimo server che ha risposto (meno attese se uno è fuori servizio). */
+    @Volatile
+    private var preferred = 0
 
     private const val HIGHWAY_TYPES =
         "motorway|motorway_link|trunk|trunk_link|primary|primary_link|secondary|secondary_link|" +
             "tertiary|tertiary_link|unclassified|residential|living_street"
 
-    private const val USER_AGENT = "CintureAuto/1.1 (app personale Android)"
+    private const val USER_AGENT = "MyMercedes/1.4 (app personale Android)"
 
     fun buildQuery(lat: Double, lon: Double, radiusM: Int): String {
         return String.format(
             Locale.US,
-            "[out:json][timeout:20];way(around:%d,%.3f,%.3f)[\"highway\"~\"^(%s)\$\"];out tags geom;",
+            "[out:json][timeout:15];way(around:%d,%.3f,%.3f)[\"highway\"~\"^(%s)\$\"];out tags geom;",
             radiusM, lat, lon, HIGHWAY_TYPES
         )
     }
@@ -51,11 +57,15 @@ object OverpassClient {
         val cLon = Math.round(lon * 1000.0) / 1000.0
         val body = "data=" + URLEncoder.encode(buildQuery(cLat, cLon, radiusM), "UTF-8")
 
-        for (endpoint in ENDPOINTS) {
-            val text = post(endpoint, body)
+        for (k in ENDPOINTS.indices) {
+            val index = (preferred + k) % ENDPOINTS.size
+            val text = post(ENDPOINTS[index], body)
             if (text != null) {
                 val ways = parse(text)
-                if (ways != null) return RoadData(cLat, cLon, radiusM, ways)
+                if (ways != null) {
+                    preferred = index
+                    return RoadData(cLat, cLon, radiusM, ways)
+                }
             }
         }
         return null
@@ -67,8 +77,8 @@ object OverpassClient {
             val c = URI(endpoint).toURL().openConnection() as HttpURLConnection
             connection = c
             c.requestMethod = "POST"
-            c.connectTimeout = 8_000
-            c.readTimeout = 25_000
+            c.connectTimeout = 6_000
+            c.readTimeout = 18_000
             c.doOutput = true
             c.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
             c.setRequestProperty("User-Agent", USER_AGENT)
@@ -135,7 +145,8 @@ object OverpassClient {
             maxspeedForward = tags.tag("maxspeed:forward"),
             maxspeedBackward = tags.tag("maxspeed:backward"),
             lats = lats,
-            lons = lons
+            lons = lons,
+            zoneTag = tags.tag("maxspeed:type") ?: tags.tag("source:maxspeed") ?: tags.tag("zone:maxspeed")
         )
     }
 }

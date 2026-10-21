@@ -21,6 +21,8 @@ class SystemEventsReceiver : BroadcastReceiver() {
             "android.intent.action.QUICKBOOT_POWERON",
             Intent.ACTION_MY_PACKAGE_REPLACED -> {
                 CarAlertService.start(context)
+                // le sveglie si cancellano al riavvio: se l'auto è parcheggiata si riprogramma il meteo
+                if (prefs.carParked && prefs.weatherAlertEnabled) WeatherScheduler.schedule(context, 120_000L)
             }
 
             BluetoothDevice.ACTION_ACL_CONNECTED,
