@@ -153,12 +153,20 @@ class VoiceAnnouncer(context: Context, private val prefs: Prefs) {
     /**
      * Pronuncia [text] dopo [delayMs]. Da subito tiene sveglia la CPU e si prenota l'audio,
      * così il passaggio dal suono alla voce è continuo anche a telefono bloccato.
+     * [maxSessionMs] è il tempo massimo concesso alla frase: per le risposte lunghe dell'intelligenza
+     * artificiale va alzato (di norma bastano i 15 secondi di default). [onFinished] resta l'ultimo
+     * parametro, così si può passare come lambda finale.
      */
-    fun announce(text: String, delayMs: Long, onFinished: (() -> Unit)? = null) {
+    fun announce(
+        text: String,
+        delayMs: Long,
+        maxSessionMs: Long = MAX_SESSION_MS,
+        onFinished: (() -> Unit)? = null
+    ) {
         cancel()
         active = true
         this.onFinished = onFinished
-        beginHold()
+        beginHold(maxSessionMs)
 
         val speak = Runnable {
             speakRunnable = null
@@ -169,7 +177,7 @@ class VoiceAnnouncer(context: Context, private val prefs: Prefs) {
 
         val end = Runnable { endSession() }
         failsafe = end
-        handler.postDelayed(end, MAX_SESSION_MS)
+        handler.postDelayed(end, maxSessionMs)
     }
 
     /** Interrompe la frase in corso (o in attesa). */
@@ -259,11 +267,11 @@ class VoiceAnnouncer(context: Context, private val prefs: Prefs) {
     // Audio e CPU
     // -------------------------------------------------------------------------------------------
 
-    private fun beginHold() {
+    private fun beginHold(maxSessionMs: Long = MAX_SESSION_MS) {
         if (wakeLock == null) {
             try {
                 val wl = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "CintureAuto:voce")
-                wl.acquire(MAX_SESSION_MS + 2_000L)
+                wl.acquire(maxSessionMs + 2_000L)
                 wakeLock = wl
             } catch (e: Exception) {
                 // senza, la voce può ritardare a telefono bloccato, ma funziona

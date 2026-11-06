@@ -161,6 +161,33 @@ class Prefs(context: Context) {
         get() = sp.getBoolean("assistantEnabled", false)
         set(v) { sp.edit().putBoolean("assistantEnabled", v).apply() }
 
+    // ---- Intelligenza artificiale (risposte libere a «Ehi Mercedes») ----
+
+    /** Se acceso, ogni domanda che non è un comando già noto viene girata all'intelligenza artificiale. */
+    var aiEnabled: Boolean
+        get() = sp.getBoolean("aiEnabled", true)
+        set(v) { sp.edit().putBoolean("aiEnabled", v).apply() }
+
+    /** Chiave gratuita personale (Groq). Resta solo nella memoria privata dell'app. */
+    var aiKey: String
+        get() = sp.getString("aiKey", "") ?: ""
+        set(v) { sp.edit().putString("aiKey", AiText.cleanKey(v)).apply() }
+
+    /** Ultimo modello che ha risposto: l'app lo sceglie da sola tra quelli attivi. */
+    var aiModel: String
+        get() = sp.getString("aiModel", "") ?: ""
+        set(v) { sp.edit().putString("aiModel", v).apply() }
+
+    /** Dice all'IA in che città ci si trova (solo il nome, mai le coordinate), per domande tipo «cosa c'è da vedere qui?». */
+    var aiSendCity: Boolean
+        get() = sp.getBoolean("aiSendCity", true)
+        set(v) { sp.edit().putBoolean("aiSendCity", v).apply() }
+
+    /** Esito dell'ultima richiesta, mostrato nella schermata. */
+    var aiStatus: String
+        get() = sp.getString("aiStatus", "") ?: ""
+        set(v) { sp.edit().putString("aiStatus", v).apply() }
+
     companion object {
         const val DEFAULT_CAR_NAME = "MB Bluetooth"
         const val DEFAULT_PHRASE = "Allacciare le cinture di sicurezza"

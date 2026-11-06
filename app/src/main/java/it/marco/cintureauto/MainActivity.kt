@@ -5,6 +5,7 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -19,6 +20,7 @@ import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
 import android.text.Editable
+import android.text.InputType
 import android.text.TextWatcher
 import android.util.TypedValue
 import android.view.Gravity
@@ -88,6 +90,11 @@ class MainActivity : Activity() {
     private lateinit var tripsRecent: TextView
     private lateinit var weatherInfo: TextView
     private lateinit var assistantInfo: TextView
+    private lateinit var aiInfo: TextView
+    private lateinit var aiKeyInput: EditText
+
+    @Volatile
+    private var aiTesting = false
     private val tripStore by lazy { TripStore(this) }
     private var tripsCache: List<Trip> = emptyList()
     private var tripsCacheVersion = -1
@@ -408,6 +415,48 @@ class MainActivity : Activity() {
                 "consuma un po' di batteria. Dopo un riavvio del telefono apri l'app una volta per riattivare l'ascolto."
         )
 
+        // ---- Intelligenza artificiale: risposte a qualsiasi domanda ----
+        val aiCard = card("Risposte a qualsiasi domanda (intelligenza artificiale)")
+        switchRow(aiCard, "Rispondi a qualsiasi domanda dopo «Ehi Mercedes»", prefs.aiEnabled) { checked ->
+            prefs.aiEnabled = checked
+            refreshStatus()
+        }
+        aiInfo = addLine(aiCard)
+        note(
+            aiCard,
+            "Serve una chiave gratuita di Groq, senza carta di credito. Si fa una volta sola: " +
+                "tocca il pulsante 1, accedi al sito e crea una chiave («Create API Key»), copiala, poi torna qui e tocca il pulsante 2."
+        )
+        actionButton(aiCard, "1 · Crea la chiave gratuita (si apre il sito di Groq)") { openAiKeyPage() }
+        actionButton(aiCard, "2 · Incolla la chiave copiata") { pasteAiKey() }
+        aiKeyInput = EditText(this)
+        aiKeyInput.setHint("oppure scrivi o incolla qui la chiave (inizia con gsk_)")
+        aiKeyInput.setInputType(InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
+        aiKeyInput.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO)
+        aiKeyInput.setText(prefs.aiKey)
+        aiKeyInput.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                prefs.aiKey = s?.toString() ?: ""
+                renderAi()
+            }
+        })
+        aiCard.addView(aiKeyInput)
+        actionButton(aiCard, "3 · ▶  Prova l'intelligenza artificiale") { testAi() }
+        switchRow(aiCard, "Dì all'IA in che città sono (solo il nome)", prefs.aiSendCity) { checked ->
+            prefs.aiSendCity = checked
+        }
+        note(
+            aiCard,
+            "Ora puoi chiedere qualunque cosa: «Ehi Mercedes, quanto è alto il Monte Bianco?», «Ehi Mercedes, raccontami una barzelletta», " +
+                "«Ehi Mercedes, cosa c'è da vedere qui?». I comandi di prima (limite di velocità, meteo) funzionano come sempre. " +
+                "Privacy: l'audio resta sul telefono. All'intelligenza artificiale (Groq) va soltanto il testo della domanda, " +
+                "con data e ora e, se l'opzione sopra è accesa, il nome della città, mai le coordinate. " +
+                "Le ultime domande restano in memoria per 5 minuti (per capire «e di quello?») e si cancellano quando l'auto si disconnette. " +
+                "La chiave resta solo in questa app. Le risposte non sono sempre esatte e non conoscono il traffico o le notizie di oggi."
+        )
+
         // ---- Registro dei viaggi ----
         section("viaggi", "📒  Viaggi")
         val tripsCard = card("Registro dei viaggi")
@@ -717,6 +766,7 @@ class MainActivity : Activity() {
         renderParking(svc)
         renderWeather()
         renderAssistant(svc)
+        renderAi()
 
         val loc = hasFineLocation()
         val bg = hasBackgroundLocation()
@@ -981,6 +1031,100 @@ class MainActivity : Activity() {
             ?: "Il servizio non è attivo, quindi non conosco la strada."
         toast(answer)
         announcerInstance?.announce(answer, 0L)
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // Intelligenza artificiale (risposte a qualsiasi domanda)
+    // -------------------------------------------------------------------------------------------
+
+    private fun renderAi() {
+        val sb = StringBuilder()
+        val key = prefs.aiKey
+        when {
+            !prefs.aiEnabled -> sb.append("Spenta: «Ehi Mercedes» capisce solo i comandi che conosce già.")
+            key.isBlank() -> sb.append("Manca la chiave gratuita: segui i passaggi 1 e 2 qui sotto.")
+            else -> sb.append("Pronta. Chiave: ").append(AiText.maskKey(key))
+        }
+        if (prefs.aiEnabled && !prefs.assistantEnabled) {
+            sb.append("\nPer usarla in auto accendi anche «Ascolta Ehi Mercedes» qui sopra.")
+        }
+        val last = prefs.aiStatus
+        if (last.isNotEmpty()) sb.append("\nUltima richiesta: ").append(last)
+        val text = sb.toString()
+        if (aiInfo.text.toString() != text) aiInfo.text = text
+    }
+
+    private fun openAiKeyPage() {
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://console.groq.com/keys")))
+        } catch (e: Exception) {
+            toast("Non trovo un browser per aprire il sito. Apri console.groq.com/keys dal tuo browser.")
+        }
+    }
+
+    /** Prende dagli appunti la chiave copiata dal sito (anche se insieme c'è altro testo) e la salva. */
+    private fun pasteAiKey() {
+        val raw: String = try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            val clip = cm?.primaryClip
+            if (clip != null && clip.itemCount > 0) clip.getItemAt(0).coerceToText(this).toString() else ""
+        } catch (e: Exception) {
+            ""
+        }
+        val found = Regex("gsk_[A-Za-z0-9_]+").find(raw)?.value
+        val key = found ?: AiText.cleanKey(raw)
+        if (key.isEmpty()) {
+            toast("Non c'è nessuna chiave negli appunti. Copia prima la chiave dal sito di Groq, poi tocca di nuovo questo pulsante.")
+            return
+        }
+        aiKeyInput.setText(key)
+        if (key.startsWith("gsk_")) {
+            toast("Chiave incollata. Ora tocca «3 · Prova».")
+        } else {
+            toast("Incollato, ma una chiave di Groq di solito inizia con «gsk_»: controlla di aver copiato quella giusta.")
+        }
+    }
+
+    /** Fa una domanda di prova e la dice a voce: così si vede subito se la chiave funziona. */
+    private fun testAi() {
+        val key = prefs.aiKey
+        if (key.isBlank()) {
+            toast("Prima serve la chiave: segui i passaggi 1 e 2.")
+            return
+        }
+        if (aiTesting) {
+            toast("Prova già in corso.")
+            return
+        }
+        aiTesting = true
+        toast("Provo a interrogare l'intelligenza artificiale…")
+        val rememberedModel = prefs.aiModel
+        Thread {
+            val now = System.currentTimeMillis()
+            val spoken = try {
+                AiSession().answer(
+                    key,
+                    rememberedModel,
+                    "Presentati in una frase e dimmi che sei pronto a rispondere alle mie domande.",
+                    now,
+                    null,
+                    remember = false
+                )
+            } catch (e: Exception) {
+                null
+            }
+            if (spoken != null) {
+                if (spoken.ok && spoken.model != null) prefs.aiModel = spoken.model
+                prefs.aiStatus = AiText.statusLine(now, spoken.problem, spoken.model, spoken.elapsedMs, spoken.detail)
+            }
+            handler.post {
+                aiTesting = false
+                val text = spoken?.text ?: AiText.problemSpeech(AiProblem.SERVER)
+                toast(text)
+                announcerInstance?.announce(text, 0L, AiText.speechBudgetMs(text, prefs.voiceRatePercent))
+                refreshStatus()
+            }
+        }.start()
     }
 
     // -------------------------------------------------------------------------------------------

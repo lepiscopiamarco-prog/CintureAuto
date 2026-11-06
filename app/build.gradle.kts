@@ -11,8 +11,8 @@ android {
         applicationId = "it.marco.cintureauto"
         minSdk = 26
         targetSdk = 34
-        versionCode = 5
-        versionName = "1.4"
+        versionCode = 6
+        versionName = "1.5"
 
         // Solo i processori dei telefoni veri: l'APK resta più leggero
         ndk {

@@ -103,6 +103,13 @@ class CarAlertService : Service() {
         private const val ASSISTANT_PAUSE_FOR_ALARM_MS = 2_500L
         private const val ASSISTANT_REPLY_FAILSAFE_MS = 15_000L
 
+        /** Mentre si aspetta la risposta dell'IA (rete) l'assistente non ascolta: più del tempo massimo di AiClient. */
+        private const val ASSISTANT_AI_WAIT_MS = 50_000L
+
+        /** Il nome della città da dire all'IA si ricalcola solo dopo questo tempo, o se ci si è spostati di più. */
+        private const val AI_CITY_CACHE_MS = 10 * 60_000L
+        private const val AI_CITY_MAX_DISTANCE_M = 3_000.0
+
         // ---- meteo ----
         private const val WEATHER_FIRST_CHECK_MS = 60_000L
 
@@ -496,6 +503,7 @@ class CarAlertService : Service() {
         // Prima di spegnere il GPS: la posizione dell'auto e la chiusura del viaggio
         saveParking()
         finishTrip()
+        ai.clearHistory()
         updateGpsState()
     }
 
@@ -744,7 +752,7 @@ class CarAlertService : Service() {
             return
         }
         if (assistant == null) {
-            val a = VoiceAssistant(this, assistantCallbacks)
+            val a = VoiceAssistant(this, assistantCallbacks, freeQuestions = { prefs.aiEnabled })
             assistant = a
             a.start()
         }
@@ -771,9 +779,77 @@ class CarAlertService : Service() {
             say(VoiceCommands.ACK)
         }
 
+        override fun onQuestion(text: String) {
+            answerWithAi(text)
+        }
+
         override fun onStatus(text: String) {
             assistantInfo = text
         }
+    }
+
+    // ---- intelligenza artificiale per «Ehi Mercedes» ----
+    private val ai = AiSession()
+    private var aiCityLat = 0.0
+    private var aiCityLon = 0.0
+    private var aiCityName: String? = null
+    private var aiCityAt = 0L
+
+    /**
+     * Domanda libera: non è un comando che l'app conosce, quindi la gira all'intelligenza artificiale
+     * e dice la risposta. Alla rete va solo il testo della domanda (mai l'audio), la data e l'ora e,
+     * se l'opzione è accesa, il nome della città.
+     */
+    private fun answerWithAi(question: String) {
+        if (!prefs.aiEnabled) {
+            say(VoiceCommands.NOT_UNDERSTOOD)
+            return
+        }
+        val key = prefs.aiKey
+        if (key.isBlank()) {
+            say(AiText.problemSpeech(AiProblem.NO_KEY))
+            return
+        }
+        val here = if (prefs.aiSendCity) {
+            lastFix ?: lastKnown(LocationManager.GPS_PROVIDER) ?: lastKnown(LocationManager.NETWORK_PROVIDER)
+        } else {
+            null
+        }
+        val lat = here?.latitude
+        val lon = here?.longitude
+        val rememberedModel = prefs.aiModel
+
+        // Finché si aspetta la rete l'assistente non ascolta (e non si fa partire due domande insieme)
+        assistant?.pauseFor(ASSISTANT_AI_WAIT_MS)
+        try {
+            voiceExecutor.execute {
+                val city = if (lat != null && lon != null) cityFor(lat, lon) else null
+                val now = System.currentTimeMillis()
+                val spoken = ai.answer(key, rememberedModel, question, now, city)
+                if (spoken.ok && spoken.model != null) prefs.aiModel = spoken.model
+                prefs.aiStatus = AiText.statusLine(now, spoken.problem, spoken.model, spoken.elapsedMs, spoken.detail)
+                // Se nel frattempo l'auto si è disconnessa, non si parla dalle casse del telefono
+                handler.post { if (!destroyed && carConnected) sayLong(spoken.text) }
+            }
+        } catch (e: Exception) {
+            say(AiText.problemSpeech(AiProblem.SERVER))
+        }
+    }
+
+    /** Il nome della città in cui ci si trova, con un po' di memoria per non interrogare il telefono a ogni domanda. */
+    private fun cityFor(lat: Double, lon: Double): String? {
+        val now = SystemClock.elapsedRealtime()
+        if (aiCityAt != 0L && now - aiCityAt < AI_CITY_CACHE_MS &&
+            SpeedLimitLogic.distanceMeters(lat, lon, aiCityLat, aiCityLon) < AI_CITY_MAX_DISTANCE_M
+        ) {
+            return aiCityName
+        }
+        val name = placeName(lat, lon)
+        aiCityLat = lat
+        aiCityLon = lon
+        aiCityName = name
+        aiCityAt = now
+        return name
     }
 
     /** "Che tempo fa?": previsione Open-Meteo nel punto in cui ti trovi (dal GPS). */
@@ -821,6 +897,13 @@ class CarAlertService : Service() {
         val a = assistant
         a?.pauseFor(ASSISTANT_REPLY_FAILSAFE_MS)
         announcer.announce(text, 0L) { assistant?.resumeSoon() }
+    }
+
+    /** Come [say], ma per le risposte lunghe dell'IA: il tempo concesso alla voce cresce con la lunghezza del testo. */
+    private fun sayLong(text: String) {
+        val budget = AiText.speechBudgetMs(text, prefs.voiceRatePercent)
+        assistant?.pauseFor(budget)
+        announcer.announce(text, 0L, budget) { assistant?.resumeSoon() }
     }
 
     /** La risposta alla domanda "qual è il limite di questa strada?", con i dati del momento. */

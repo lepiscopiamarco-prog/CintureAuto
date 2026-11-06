@@ -26,6 +26,9 @@ object VoiceCommands {
     /** "Mercedes" in qualsiasi punto (vale solo se nella stessa frase c'è anche una domanda). */
     private val MERC_ANYWHERE = Regex("(?:^|\\s)$MERC")
 
+    /** Saluto + Mercedes, ma solo all'inizio della frase: serve per le domande libere all'IA. */
+    private val WAKE_START_WITH_HEY = Regex("^$HEY\\s+$MERC")
+
     /** Minuscolo, senza accenti né punteggiatura, spazi singoli. */
     fun normalize(text: String): String {
         val noAccents = Normalizer.normalize(text.lowercase(Locale.ITALY), Normalizer.Form.NFD)
@@ -46,6 +49,20 @@ object VoiceCommands {
         val rest = t.substring(any.range.last + 1).trim()
         return if (parse(rest) != Command.UNKNOWN) rest else null
     }
+
+    /**
+     * Come [afterWakeWord], ma «Ehi Mercedes» deve stare all'INIZIO della frase. Serve per le domande
+     * libere all'intelligenza artificiale: così non risponde a chi nomina la Mercedes a metà di una
+     * conversazione («…Audi e Mercedes sono ottime…»). Restituisce il testo dopo il richiamo, o null.
+     */
+    fun questionAfterWake(text: String): String? {
+        val t = normalize(text)
+        val m = WAKE_START_WITH_HEY.find(t) ?: WAKE_AT_START.find(t) ?: return null
+        return t.substring(m.range.last + 1).trim()
+    }
+
+    /** Una domanda vera e non un mugugno o una sillaba sfuggita al riconoscimento: almeno 3 caratteri. */
+    fun isMeaningful(text: String): Boolean = normalize(text).length >= 3
 
     fun parse(text: String): Command {
         val t = " " + normalize(text) + " "
@@ -132,11 +149,27 @@ class WakeDetector(
     /** Dopo "Ehi Mercedes" senza domanda, si aspetta così prima di dire "Dimmi". */
     private val wakeOnlyWaitMs: Long = 2_200L,
     /** Dopo "Dimmi" si aspetta la domanda per questo tempo. */
-    private val awaitCommandMs: Long = 8_000L
+    private val awaitCommandMs: Long = 8_000L,
+    /**
+     * Vero se le domande libere (all'intelligenza artificiale) sono accese. Si legge dal vivo, così
+     * un cambio di impostazione vale subito. Se è falso tutto funziona come prima.
+     */
+    private val freeQuestions: () -> Boolean = { false },
+    /** Una domanda libera parte quando il testo provvisorio resta uguale per questo tempo (le domande hanno pause). */
+    private val questionStableMs: Long = 1_500L,
+    /** Quando il motore vocale chiude la frase si aspetta ancora un attimo: la domanda potrebbe continuare dopo una pausa. */
+    private val questionGraceMs: Long = 700L,
+    /** Dopo "Dimmi", se si sta già parlando, l'attesa si allunga ma non oltre questo tempo totale. */
+    private val awaitCapMs: Long = 25_000L
 ) {
-    enum class Kind { NONE, COMMAND, WAKE_ONLY }
+    enum class Kind { NONE, COMMAND, WAKE_ONLY, QUESTION }
 
-    data class Action(val kind: Kind, val command: VoiceCommands.Command = VoiceCommands.Command.UNKNOWN) {
+    data class Action(
+        val kind: Kind,
+        val command: VoiceCommands.Command = VoiceCommands.Command.UNKNOWN,
+        /** Per Kind.QUESTION: la domanda (testo senza accenti né punteggiatura, come la trascrive il motore vocale). */
+        val question: String = ""
+    ) {
         val isNone: Boolean get() = kind == Kind.NONE
     }
 
@@ -146,6 +179,11 @@ class WakeDetector(
     private var lastChangeAt = 0L
     private var wakeSeenAt = -1L
     private var awaitingUntil = 0L
+    private var awaitStartedAt = 0L
+
+    /** Domanda libera già ascoltata, in attesa di capire se chi parla continua dopo una pausa. */
+    private var pending: String? = null
+    private var pendingAt = 0L
 
     val isAwaiting: Boolean get() = awaitingUntil > 0L
 
@@ -154,6 +192,7 @@ class WakeDetector(
         lastPartial = ""
         lastChangeAt = 0L
         wakeSeenAt = -1L
+        pending = null
     }
 
     private fun decide(text: String, now: Long, final: Boolean): Action {
@@ -165,9 +204,21 @@ class WakeDetector(
                 reset()
                 return Action(Kind.COMMAND, c)
             }
+            // Non è un comando che l'app conosce: con l'IA accesa è una domanda libera
+            if (freeQuestions()) {
+                val q = VoiceCommands.questionAfterWake(text)
+                if (q != null && VoiceCommands.isMeaningful(q)) return collectQuestion(q, now, final)
+            }
             if (wakeSeenAt < 0L) wakeSeenAt = now
             if (final) return wakeOnly(now)
             return none
+        }
+        // La domanda libera è continuata dopo una pausa: si unisce a quanto già ascoltato
+        val carried = pending
+        if (carried != null && freeQuestions()) {
+            val more = VoiceCommands.normalize(text)
+            if (more.isEmpty()) return none
+            return collectQuestion("$carried $more", now, final)
         }
         if (awaitingUntil > 0L) {
             if (now > awaitingUntil) {
@@ -175,7 +226,16 @@ class WakeDetector(
                 return none
             }
             val c = VoiceCommands.parse(text)
-            if (c != VoiceCommands.Command.UNKNOWN || final) {
+            if (c != VoiceCommands.Command.UNKNOWN) {
+                awaitingUntil = 0L
+                reset()
+                return Action(Kind.COMMAND, c)
+            }
+            // Dopo "Dimmi": ciò che non è un comando noto è una domanda libera
+            if (freeQuestions() && VoiceCommands.isMeaningful(text)) {
+                return collectQuestion(VoiceCommands.normalize(text), now, final)
+            }
+            if (final) {
                 awaitingUntil = 0L
                 reset()
                 return Action(Kind.COMMAND, c)
@@ -184,10 +244,41 @@ class WakeDetector(
         return none
     }
 
+    /**
+     * Una domanda libera da portare all'IA. Parte solo quando chi parla ha finito:
+     *  - frase chiusa dal motore vocale: si aspetta ancora [questionGraceMs] (potrebbe continuare);
+     *  - frase mai chiusa (rumore): il testo provvisorio deve restare uguale per [questionStableMs].
+     */
+    private fun collectQuestion(q: String, now: Long, final: Boolean): Action {
+        if (final) {
+            pending = q
+            pendingAt = now
+            awaitingUntil = 0L
+            wakeSeenAt = -1L
+            return none
+        }
+        if (now - lastChangeAt >= questionStableMs) return fireQuestion(q)
+        return none
+    }
+
+    private fun fireQuestion(q: String): Action {
+        awaitingUntil = 0L
+        reset()
+        return Action(Kind.QUESTION, question = q)
+    }
+
     private fun wakeOnly(now: Long): Action {
         reset()
         awaitingUntil = now + awaitCommandMs
+        awaitStartedAt = now
         return Action(Kind.WAKE_ONLY)
+    }
+
+    /** Si sta già facendo una domanda libera (non va interrotta con "Dimmi")? */
+    private fun questionInProgress(partial: String): Boolean {
+        if (pending != null) return true
+        val q = VoiceCommands.questionAfterWake(partial) ?: return false
+        return VoiceCommands.isMeaningful(q)
     }
 
     /** Testo definitivo di una frase. */
@@ -205,6 +296,10 @@ class WakeDetector(
             lastPartial = text
             lastChangeAt = now
             if (wakeSeenAt < 0L && text.isNotBlank() && VoiceCommands.afterWakeWord(text) != null) wakeSeenAt = now
+            // Dopo "Dimmi", finché si sta parlando l'attesa si allunga (domande lunghe), con un tetto
+            if (freeQuestions() && awaitingUntil > 0L && text.isNotBlank()) {
+                awaitingUntil = maxOf(awaitingUntil, minOf(now + 4_000L, awaitStartedAt + awaitCapMs))
+            }
         }
         return tick(now)
     }
@@ -213,6 +308,10 @@ class WakeDetector(
     fun tick(now: Long): Action {
         if (awaitingUntil > 0L && now > awaitingUntil) awaitingUntil = 0L
         val partial = lastPartial
+        val carried = pending
+        if (carried != null && partial.isBlank() && now - pendingAt >= questionGraceMs) {
+            return fireQuestion(carried)
+        }
         if (partial.isNotBlank() && now - lastChangeAt >= stableMs) {
             val a = decide(partial, now, false)
             if (!a.isNone) return a
@@ -220,7 +319,10 @@ class WakeDetector(
         if (wakeSeenAt >= 0L && now - wakeSeenAt >= wakeOnlyWaitMs) {
             // ha detto "Ehi Mercedes" ma la domanda non arriva: rispondo "Dimmi"
             val after = VoiceCommands.afterWakeWord(partial)
-            if (after == null || VoiceCommands.parse(after) == VoiceCommands.Command.UNKNOWN) return wakeOnly(now)
+            if (after == null || VoiceCommands.parse(after) == VoiceCommands.Command.UNKNOWN) {
+                // ...a meno che non stia già facendo una domanda lunga: non va interrotta
+                if (!(freeQuestions() && questionInProgress(partial))) return wakeOnly(now)
+            }
         }
         return none
     }

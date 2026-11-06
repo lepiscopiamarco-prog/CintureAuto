@@ -141,7 +141,12 @@ object VoiceModel {
  * Ascolta il microfono senza sosta (solo con l'auto collegata) e riconosce «Ehi Mercedes».
  * Tutto il riconoscimento avviene sul telefono. I risultati arrivano sul thread principale.
  */
-class VoiceAssistant(context: Context, private val callbacks: Callbacks) {
+class VoiceAssistant(
+    context: Context,
+    private val callbacks: Callbacks,
+    /** Vero se le domande libere (all'intelligenza artificiale) sono accese; letto dal vivo. */
+    freeQuestions: () -> Boolean = { false }
+) {
 
     interface Callbacks {
         /** È stato detto "Ehi Mercedes" seguito da una domanda (o la domanda dopo "Dimmi"). UNKNOWN = non capita. */
@@ -149,6 +154,9 @@ class VoiceAssistant(context: Context, private val callbacks: Callbacks) {
 
         /** È stato detto solo "Ehi Mercedes": rispondere "Dimmi" e aspettare la domanda. */
         fun onWakeOnly()
+
+        /** Una domanda libera (non è un comando noto), da girare all'intelligenza artificiale. Solo se le domande libere sono accese. */
+        fun onQuestion(text: String) {}
 
         fun onStatus(text: String)
     }
@@ -214,7 +222,7 @@ class VoiceAssistant(context: Context, private val callbacks: Callbacks) {
         handler.post { if (running) block() }
     }
 
-    private val detector = WakeDetector()
+    private val detector = WakeDetector(freeQuestions = freeQuestions)
 
     /** Ascolta finché è acceso; se qualcosa si rompe riprova da solo dopo qualche secondo. */
     private fun loop() {
@@ -310,6 +318,7 @@ class VoiceAssistant(context: Context, private val callbacks: Callbacks) {
                     when (action.kind) {
                         WakeDetector.Kind.COMMAND -> post { callbacks.onCommand(action.command) }
                         WakeDetector.Kind.WAKE_ONLY -> post { callbacks.onWakeOnly() }
+                        WakeDetector.Kind.QUESTION -> post { callbacks.onQuestion(action.question) }
                         else -> {}
                     }
                 }
